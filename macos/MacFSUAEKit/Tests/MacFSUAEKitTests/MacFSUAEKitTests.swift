@@ -111,7 +111,7 @@ import Testing
 }
 
 @MainActor
-@Test func mcpListsToolsAndManagesConfigurations() throws {
+@Test func mcpListsToolsAndManagesConfigurations() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
     let suite = "fsuae-mcp-\(UUID().uuidString)"
@@ -125,36 +125,36 @@ import Testing
                                    session: MacFSUAEEngineSession(),
                                    startAutomatically: false)
 
-    func request(_ method: String, params: [String: Any] = [:]) throws -> [String: Any] {
+    func request(_ method: String, params: [String: Any] = [:]) async throws -> [String: Any] {
         let data = try JSONSerialization.data(withJSONObject: [
             "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
         ])
-        let reply = server.handleMCPRequest(data)
+        let reply = await server.handleMCPRequest(data)
         #expect(reply.status == 200)
         let body = try #require(reply.body)
         return try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
     }
 
-    let initialized = try request("initialize")
+    let initialized = try await request("initialize")
     let initializeResult = try #require(initialized["result"] as? [String: Any])
     #expect(initializeResult["protocolVersion"] as? String == "2025-11-25")
 
-    let listedTools = try request("tools/list")
+    let listedTools = try await request("tools/list")
     let toolsResult = try #require(listedTools["result"] as? [String: Any])
-    #expect((toolsResult["tools"] as? [[String: Any]])?.count == 13)
+    #expect((toolsResult["tools"] as? [[String: Any]])?.count == 21)
 
-    let listedMachines = try request("tools/call", params: [
+    let listedMachines = try await request("tools/call", params: [
         "name": "fsuae_machines_list", "arguments": [:],
     ])
     let machineResult = try #require(listedMachines["result"] as? [String: Any])
     let machineContent = try #require(machineResult["content"] as? [[String: Any]])
     #expect(machineContent.first?["text"] as? String == "[\n\n]")
 
-    _ = try request("tools/call", params: [
+    _ = try await request("tools/call", params: [
         "name": "fsuae_configuration_add",
         "arguments": ["name": "Agent A1200", "model": "A1200"],
     ])
-    _ = try request("tools/call", params: [
+    _ = try await request("tools/call", params: [
         "name": "fsuae_configuration_duplicate",
         "arguments": ["source": "Agent A1200", "name": "Agent A1200 Copy"],
     ])

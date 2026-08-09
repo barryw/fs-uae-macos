@@ -2383,12 +2383,34 @@ control_proc:
 	jsr -$001e(a6) ; Open
 	move.l d0,d4
 	beq.w .delay
+	cmp.w #36,20(a5) ; SystemTagList requires dos.library V36
+	blo.s .execute_old
+	clr.l -(sp) ; TAG_DONE data
+	clr.l -(sp) ; TAG_DONE
+	move.l d4,-(sp) ; output handle
+	move.l #$80000022,-(sp) ; SYS_Output
+	lea 1(a3),a0
+	move.l a0,d1
+	move.l sp,d2
+	jsr -$025e(a6) ; SystemTagList
+	lea 16(sp),sp
+	move.l d0,d6 ; real command return code
+	moveq #1,d7 ; exit code is known
+	bra.s .close_output
+.execute_old
 	lea 1(a3),a0
 	move.l a0,d1
 	moveq #0,d2
 	move.l d4,d3
 	jsr -$00de(a6) ; Execute
-	move.l d0,d6
+	moveq #0,d7 ; Execute only reports whether the command started
+	tst.l d0
+	beq.s .execute_failed
+	moveq #0,d6
+	bra.s .close_output
+.execute_failed
+	moveq #20,d6
+.close_output
 	move.l d4,d1
 	jsr -$0024(a6) ; Close
 	bra.s .status
@@ -2397,29 +2419,41 @@ control_proc:
 	lea control_transfer(pc),a0
 	lea 1(a3),a1
 	bsr.s control_copy
-	move.l d0,d6
-	bra.s .status
+	bra.s .copy_result
 .get
 	lea 1(a3),a0
 	lea control_transfer(pc),a1
 	bsr.s control_copy
-	move.l d0,d6
+.copy_result
+	moveq #1,d7
+	tst.l d0
+	beq.s .copy_failed
+	moveq #0,d6
+	bra.s .status
+.copy_failed
+	moveq #20,d6
 
 .status
+	move.b #'0',(a3)
+	tst.l d6
+	bne.s .status_known
+	move.b #'1',(a3)
+.status_known
+	move.b #'0',1(a3)
+	tst.l d7
+	beq.s .status_code
+	move.b #'1',1(a3)
+.status_code
+	move.l d6,2(a3)
 	lea control_status(pc),a0
 	move.l a0,d1
 	move.l #1006,d2 ; MODE_NEWFILE
 	jsr -$001e(a6) ; Open
 	move.l d0,d4
 	beq.w .delay
-	lea control_failed(pc),a0
-	tst.l d6
-	beq.s .write_status
-	lea control_succeeded(pc),a0
-.write_status
 	move.l d4,d1
-	move.l a0,d2
-	moveq #1,d3
+	move.l a3,d2
+	moveq #6,d3
 	jsr -$0030(a6) ; Write
 	move.l d4,d1
 	jsr -$0024(a6) ; Close
@@ -3121,8 +3155,6 @@ control_command: dc.b 'MCP:FSUAE-Control-Command',0
 control_output: dc.b 'MCP:FSUAE-Control-Output',0
 control_status: dc.b 'MCP:FSUAE-Control-Status',0
 control_transfer: dc.b 'MCP:FSUAE-Control-Transfer',0
-control_succeeded: dc.b '1'
-control_failed: dc.b '0'
 mhname: dc.b 'UAE mouse driver',0
 kaname: dc.b 'UAE heart beat',0
 exter_name: dc.b 'UAE filesystem',0

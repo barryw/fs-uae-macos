@@ -35,6 +35,14 @@ public struct MacFSUAEHealth: Sendable {
     public let execBase: UInt32
     public let lastAlert: [UInt32]
     public let guestControlReady: Bool
+    public let guestControlHeartbeat: UInt32
+    public let guestControlGeneration: UInt32
+    public let exceptionSequence: UInt64
+    public let exceptionVector: UInt32
+    public let exceptionPC: UInt32
+    public let exceptionAddress: UInt32
+    public let exceptionTask: UInt32
+    public let exceptionTaskName: String
 }
 
 public final class MacFSUAEFrameSource: @unchecked Sendable {
@@ -327,12 +335,39 @@ public final class MacFSUAEEngineSession: ObservableObject {
     public func health() -> MacFSUAEHealth? {
         var value = fsuaemac_health()
         guard MacFSUAEEngineGetHealth(&value) != 0 else { return nil }
+        let taskName = withUnsafeBytes(of: &value.exception_task_name) { bytes in
+            let length = bytes.firstIndex(of: 0) ?? bytes.count
+            return String(data: Data(bytes.prefix(length)), encoding: .isoLatin1) ?? ""
+        }
         return MacFSUAEHealth(
             frameSequence: value.frame_sequence, programCounter: value.program_counter,
             execBase: value.exec_base,
             lastAlert: [value.last_alert.0, value.last_alert.1,
                         value.last_alert.2, value.last_alert.3],
-            guestControlReady: value.guest_control_ready != 0)
+            guestControlReady: value.guest_control_ready != 0,
+            guestControlHeartbeat: value.guest_control_heartbeat,
+            guestControlGeneration: value.guest_control_generation,
+            exceptionSequence: value.exception_sequence,
+            exceptionVector: value.exception_vector,
+            exceptionPC: value.exception_pc,
+            exceptionAddress: value.exception_address,
+            exceptionTask: value.exception_task,
+            exceptionTaskName: taskName)
+    }
+
+    public func clearException() {
+        guard isRunning else { return }
+        MacFSUAEEngineClearException()
+    }
+
+    public func debugCommand(_ command: String) -> String? {
+        var output = [CChar](repeating: 0, count: 1_048_576)
+        let succeeded = command.withCString {
+            MacFSUAEEngineDebugCommand($0, &output, UInt32(output.count), 5_000)
+        }
+        guard succeeded != 0 else { return nil }
+        let bytes = output.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     public func setAudioEnabled(_ enabled: Bool) {

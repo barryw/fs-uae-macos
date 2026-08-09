@@ -21,10 +21,13 @@ void MacFSUAEEngineSetDriveStatusCallback(fsuaemac_drive_status_callback callbac
 int MacFSUAEEngineStart(const fsuaemac_configuration *configuration);
 int MacFSUAEEngineIsRunning(void);
 int MacFSUAEEngineGetHealth(fsuaemac_health *health);
+void MacFSUAEEngineClearException(void);
 void MacFSUAEEngineStop(void);
 int MacFSUAEEngineQueueKey(uint16_t key, int32_t pressed);
 int MacFSUAEEngineQueueMouseMove(int32_t deltaX, int32_t deltaY);
 int MacFSUAEEngineQueueMouseButton(uint32_t button, int32_t pressed);
+int MacFSUAEEngineDebugCommand(const char *command, char *output,
+                               uint32_t outputSize, uint32_t timeoutMilliseconds);
 int MacFSUAEEngineSetSpeed(double multiplier);
 int MacFSUAEEngineQueuePause(int32_t paused);
 int MacFSUAEEngineQueueReset(int32_t hard);

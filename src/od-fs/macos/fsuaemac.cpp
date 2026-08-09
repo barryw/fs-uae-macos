@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <thread>
 #include <utility>
@@ -18,6 +19,7 @@
 #include "sysdeps.h"
 #include "uae/uae.h"
 #include "newcpu.h"
+#include "debug.h"
 #include "filesys.h"
 #include "uae/memory.h"
 extern "C" {
@@ -32,13 +34,21 @@ extern "C" {
 
 namespace {
 
-enum class CommandType { input, pause, reset, floppy, quit };
+enum class CommandType { input, pause, reset, floppy, debug, quit };
+
+struct DebugRequest {
+    std::mutex mutex;
+    std::condition_variable ready;
+    bool complete = false;
+    std::string output;
+};
 
 struct Command {
     CommandType type;
     int first;
     int second;
     std::string path;
+    std::shared_ptr<DebugRequest> debug_request;
 };
 
 struct StartArguments {
@@ -71,11 +81,29 @@ std::atomic<uint64_t> timing_generation{1};
 std::atomic<uint32_t> health_program_counter{0};
 std::atomic<uint32_t> health_exec_base{0};
 std::atomic<uint32_t> health_last_alert[4];
+std::atomic<uint64_t> health_exception_sequence{0};
+std::atomic<uint32_t> health_exception_vector{0};
+std::atomic<uint32_t> health_exception_pc{0};
+std::atomic<uint32_t> health_exception_address{0};
+std::atomic<uint32_t> health_exception_task{0};
+std::mutex health_exception_mutex;
+char health_exception_task_name[64];
 double native_refresh_rate = 50.0;
 bool floppy_active[4];
 int floppy_count;
 
 int configured_floppy_count();
+
+void clear_exception_health()
+{
+    std::lock_guard<std::mutex> lock(health_exception_mutex);
+    health_exception_sequence = 0;
+    health_exception_vector = 0;
+    health_exception_pc = 0;
+    health_exception_address = 0;
+    health_exception_task = 0;
+    health_exception_task_name[0] = '\0';
+}
 
 void pace_frame()
 {
@@ -273,10 +301,25 @@ void process_commands(int)
                     amiga_pause(native_paused);
                     break;
                 case CommandType::reset:
+                    clear_exception_health();
                     amiga_reset(command.first);
                     break;
                 case CommandType::floppy:
                     amiga_floppy_set_file(command.first, command.path.c_str());
+                    break;
+                case CommandType::debug:
+                    if (command.debug_request) {
+                        std::vector<TCHAR> output(1024 * 1024);
+#ifdef DEBUGGER
+                        debug_parser(command.path.c_str(), output.data(), output.size());
+#else
+                        std::snprintf(output.data(), output.size(), "Debugger is unavailable\n");
+#endif
+                        std::lock_guard<std::mutex> lock(command.debug_request->mutex);
+                        command.debug_request->output = output.data();
+                        command.debug_request->complete = true;
+                        command.debug_request->ready.notify_one();
+                    }
                     break;
                 case CommandType::quit:
                     native_paused = false;
@@ -325,6 +368,17 @@ void *run_engine(void *opaque)
     g_fs_uae_config_dir_path = strdup(configuration_dir.c_str());
     fs_emu_path_set_expand_function(fs_uae_expand_path);
     fs_config_read_file(configuration_path.c_str(), 0);
+    for (int drive = 0; drive < 4; ++drive) {
+        char environment_key[32];
+        char option_key[32];
+        std::snprintf(environment_key, sizeof(environment_key),
+                      "FSUAE_MAC_FLOPPY_%d", drive);
+        const char *override_path = std::getenv(environment_key);
+        if (override_path) {
+            std::snprintf(option_key, sizeof(option_key), "floppy_drive_%d", drive);
+            fs_config_set_string(option_key, override_path);
+        }
+    }
     native_refresh_rate = fs_config_get_boolean("ntsc_mode") == 1 ? 59.94 : 50.0;
     ++timing_generation;
     fs_uae_init_path_resolver();
@@ -366,6 +420,36 @@ int queue_command(Command command)
 } // namespace
 
 extern "C" {
+
+void uae_cpu_exception_hook(int vector, uae_u32 pc, uae_u32 address)
+{
+    uint32_t task = 0;
+    char task_name[64] = {};
+    if (valid_address(4, 4)) {
+        const uint32_t exec_base = get_long(4);
+        if (exec_base > 0x100 && valid_address(exec_base + 0x114, 4)) {
+            task = get_long(exec_base + 0x114);
+        }
+    }
+    if (task && valid_address(task + 10, 4)) {
+        const uint32_t name = get_long(task + 10);
+        for (size_t index = 0; name && index + 1 < sizeof(task_name) &&
+             valid_address(name + index, 1); ++index) {
+            task_name[index] = static_cast<char>(get_byte(name + index));
+            if (!task_name[index]) break;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(health_exception_mutex);
+    if (health_exception_sequence != 0) return;
+    health_exception_vector = static_cast<uint32_t>(vector);
+    health_exception_pc = pc;
+    health_exception_address = address;
+    health_exception_task = task;
+    std::snprintf(health_exception_task_name,
+                  sizeof(health_exception_task_name), "%s", task_name);
+    ++health_exception_sequence;
+}
 
 void fsuaemac_set_video_callback(fsuaemac_video_callback callback, void *context)
 {
@@ -414,6 +498,7 @@ int fsuaemac_start(const fsuaemac_configuration *configuration)
         commands.clear();
         native_paused = false;
     }
+    clear_exception_health();
     running = true;
 
     auto *arguments = new StartArguments;
@@ -447,7 +532,25 @@ int fsuaemac_get_health(fsuaemac_health *health)
         health->last_alert[i] = health_last_alert[i].load();
     }
     health->guest_control_ready = filesys_guest_control_is_ready();
+    health->guest_control_heartbeat = filesys_guest_control_heartbeat();
+    health->guest_control_generation = filesys_guest_control_generation();
+    {
+        std::lock_guard<std::mutex> lock(health_exception_mutex);
+        health->exception_sequence = health_exception_sequence.load();
+        health->exception_vector = health_exception_vector.load();
+        health->exception_pc = health_exception_pc.load();
+        health->exception_address = health_exception_address.load();
+        health->exception_task = health_exception_task.load();
+        std::snprintf(health->exception_task_name,
+                      sizeof(health->exception_task_name), "%s",
+                      health_exception_task_name);
+    }
     return 1;
+}
+
+void fsuaemac_clear_exception(void)
+{
+    clear_exception_health();
 }
 
 void fsuaemac_stop(void)
@@ -456,7 +559,7 @@ void fsuaemac_stop(void)
         return;
     }
     if (running) {
-        queue_command({CommandType::quit, 0, 0, {}});
+        queue_command({CommandType::quit, 0, 0, {}, {}});
     }
     pthread_join(engine_thread, nullptr);
     running = false;
@@ -464,7 +567,7 @@ void fsuaemac_stop(void)
 
 int fsuaemac_queue_input(int32_t event, int32_t state)
 {
-    return queue_command({CommandType::input, event, state, {}});
+    return queue_command({CommandType::input, event, state, {}, {}});
 }
 
 int fsuaemac_queue_key(uint16_t key, int32_t pressed)
@@ -536,11 +639,11 @@ int fsuaemac_queue_mouse_move(int32_t delta_x, int32_t delta_y)
     std::lock_guard<std::mutex> lock(command_mutex);
     if (delta_x) {
         commands.push_back({CommandType::input, INPUTEVENT_MOUSE1_HORIZ,
-                            delta_x, {}});
+                            delta_x, {}, {}});
     }
     if (delta_y) {
         commands.push_back({CommandType::input, INPUTEVENT_MOUSE1_VERT,
-                            delta_y, {}});
+                            delta_y, {}, {}});
     }
     return 1;
 }
@@ -569,12 +672,12 @@ int fsuaemac_set_speed(double multiplier)
 
 int fsuaemac_queue_pause(int32_t paused)
 {
-    return queue_command({CommandType::pause, paused != 0, 0, {}});
+    return queue_command({CommandType::pause, paused != 0, 0, {}, {}});
 }
 
 int fsuaemac_queue_reset(int32_t hard)
 {
-    return queue_command({CommandType::reset, hard != 0, 0, {}});
+    return queue_command({CommandType::reset, hard != 0, 0, {}, {}});
 }
 
 int fsuaemac_queue_floppy(int32_t drive, const char *path)
@@ -582,7 +685,28 @@ int fsuaemac_queue_floppy(int32_t drive, const char *path)
     if (drive < 0 || drive >= 4 || !path) {
         return 0;
     }
-    return queue_command({CommandType::floppy, drive, 0, path});
+    return queue_command({CommandType::floppy, drive, 0, path, {}});
+}
+
+int fsuaemac_debug_command(const char *command, char *output,
+                           uint32_t output_size, uint32_t timeout_ms)
+{
+    if (!command || !output || output_size == 0 || std::strlen(command) >= 100) {
+        set_error("Invalid debugger command");
+        return 0;
+    }
+    auto request = std::make_shared<DebugRequest>();
+    if (!queue_command({CommandType::debug, 0, 0, command, request})) {
+        return 0;
+    }
+    std::unique_lock<std::mutex> lock(request->mutex);
+    if (!request->ready.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                 [&] { return request->complete; })) {
+        set_error("Debugger command timed out");
+        return 0;
+    }
+    std::snprintf(output, output_size, "%s", request->output.c_str());
+    return 1;
 }
 
 const char *fsuaemac_last_error(void)

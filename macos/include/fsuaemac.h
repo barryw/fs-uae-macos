@@ -57,6 +57,14 @@ typedef struct fsuaemac_health {
     uint32_t exec_base;
     uint32_t last_alert[4];
     uint32_t guest_control_ready;
+    uint32_t guest_control_heartbeat;
+    uint32_t guest_control_generation;
+    uint64_t exception_sequence;
+    uint32_t exception_vector;
+    uint32_t exception_pc;
+    uint32_t exception_address;
+    uint32_t exception_task;
+    char exception_task_name[64];
 } fsuaemac_health;
 
 typedef void (*fsuaemac_video_callback)(const fsuaemac_video_frame *frame,
@@ -79,11 +87,14 @@ FSUAE_MAC_API void fsuaemac_set_drive_status_callback(
 FSUAE_MAC_API int fsuaemac_start(const fsuaemac_configuration *configuration);
 FSUAE_MAC_API int fsuaemac_is_running(void);
 FSUAE_MAC_API int fsuaemac_get_health(fsuaemac_health *health);
+FSUAE_MAC_API void fsuaemac_clear_exception(void);
 FSUAE_MAC_API void fsuaemac_stop(void);
 FSUAE_MAC_API int fsuaemac_queue_input(int32_t event, int32_t state);
 FSUAE_MAC_API int fsuaemac_queue_key(uint16_t mac_key_code, int32_t pressed);
 FSUAE_MAC_API int fsuaemac_queue_mouse_move(int32_t delta_x, int32_t delta_y);
 FSUAE_MAC_API int fsuaemac_queue_mouse_button(uint32_t button, int32_t pressed);
+FSUAE_MAC_API int fsuaemac_debug_command(const char *command, char *output,
+                                         uint32_t output_size, uint32_t timeout_ms);
 FSUAE_MAC_API int fsuaemac_set_speed(double multiplier);
 FSUAE_MAC_API int fsuaemac_queue_pause(int32_t paused);
 FSUAE_MAC_API int fsuaemac_queue_reset(int32_t hard);

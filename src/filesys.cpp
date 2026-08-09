@@ -83,6 +83,7 @@ int log_filesys = 0;
 static std::atomic<bool> fsuae_guest_control_ready{false};
 static std::atomic<bool> fsuae_guest_control_started{false};
 static std::atomic<uae_u32> fsuae_guest_control_heartbeats{0};
+static std::atomic<uae_u32> fsuae_guest_control_generation{0};
 
 enum {
 	FSUAEDEV_QUERY = 0x8001,
@@ -235,6 +236,16 @@ static uae_u32 REGPARAM2 fsuaedev_abortio(TrapContext *context)
 int filesys_guest_control_is_ready(void)
 {
 	return fsuae_guest_control_ready.load();
+}
+
+uae_u32 filesys_guest_control_heartbeat(void)
+{
+	return fsuae_guest_control_heartbeats.load();
+}
+
+uae_u32 filesys_guest_control_generation(void)
+{
+	return fsuae_guest_control_generation.load();
 }
 
 #if TRACING_ENABLED
@@ -7104,6 +7115,7 @@ void filesys_reset (void)
 	fsuae_guest_control_ready = false;
 	fsuae_guest_control_started = false;
 	fsuae_guest_control_heartbeats = 0;
+	fsuae_guest_control_generation++;
 	if (fsuaedev_enabled())
 		fsuaedev_log_event("guest reset");
 	load_injected_icons();

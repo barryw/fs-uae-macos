@@ -57,6 +57,7 @@ mkdir -p "$CONTENTS/Resources/fs-uae"
 cp -R "$ROOT_DIR/share/fs-uae/floppy_sounds" "$CONTENTS/Resources/fs-uae/"
 mkdir -p "$CONTENTS/Resources/Amiga"
 cp "$ROOT_DIR/.build/amiga/FSUAE-Diag" "$CONTENTS/Resources/Amiga/FSUAE-Diag"
+cp "$ROOT_DIR/.build/amiga/FSUAE-WaitWB" "$CONTENTS/Resources/Amiga/FSUAE-WaitWB"
 
 chmod u+w "$FRAMEWORKS/libfsuaemac.dylib"
 install_name_tool -id "@rpath/libfsuaemac.dylib" "$FRAMEWORKS/libfsuaemac.dylib"

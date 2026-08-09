@@ -56,7 +56,9 @@ struct FSUAEWorker {
             }
             if heartbeat.duration(to: .now) >= .seconds(1), let health = session.health() {
                 let alert = health.lastAlert.map(String.init).joined(separator: " ")
-                fputs("FSUAE_HEALTH \(health.frameSequence) \(health.programCounter) \(health.execBase) \(alert) \(health.guestControlReady ? 1 : 0)\n", stderr)
+                let task = health.exceptionTaskName.isEmpty ? "-" :
+                    Data(health.exceptionTaskName.utf8).base64EncodedString()
+                fputs("FSUAE_HEALTH \(health.frameSequence) \(health.programCounter) \(health.execBase) \(alert) \(health.guestControlReady ? 1 : 0) \(health.guestControlHeartbeat) \(health.guestControlGeneration) \(health.exceptionSequence) \(health.exceptionVector) \(health.exceptionPC) \(health.exceptionAddress) \(health.exceptionTask) \(task)\n", stderr)
                 fflush(stderr)
                 heartbeat = .now
             }
@@ -94,9 +96,44 @@ struct FSUAEWorker {
                 session.ejectFloppy(drive)
             }
         case "audio": session.setAudioEnabled(command["enabled"] as? Bool ?? false)
-        case "stop": session.stop()
+        case "clear_exception": session.clearException()
+        case "debug":
+            guard let request = command["request_id"] as? String,
+                  UUID(uuidString: request) != nil,
+                  let commands = command["commands"] as? [String],
+                  !commands.isEmpty,
+                  let exchange = ProcessInfo.processInfo.environment["FSUAE_MAC_EXCHANGE_DIRECTORY"]
+            else { return }
+            var output = ""
+            var succeeded = true
+            for debuggerCommand in commands {
+                output += "> \(debuggerCommand)\n"
+                if let result = session.debugCommand(debuggerCommand) {
+                    output += result
+                    if !result.hasSuffix("\n") { output += "\n" }
+                } else {
+                    output += "Debugger command failed\n"
+                    succeeded = false
+                    break
+                }
+            }
+            let result: [String: Any] = ["succeeded": succeeded, "output": output]
+            if let data = try? JSONSerialization.data(withJSONObject: result) {
+                try? data.write(to: URL(fileURLWithPath: exchange)
+                    .appendingPathComponent("FSUAE-Debug-\(request)"), options: .atomic)
+            }
+        case "stop": stopSession(session)
         default: break
         }
+    }
+
+    @MainActor
+    private static func stopSession(_ session: MacFSUAEEngineSession) {
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 2) {
+            Darwin._exit(0)
+        }
+        session.stop()
+        Darwin.exit(0)
     }
 
     private static func emitDrives(_ drives: [MacFSUAEDrive]) {
@@ -116,7 +153,7 @@ struct FSUAEWorker {
         source.setEventHandler {
             fputs("FSUAE_STATUS stopping\n", stderr)
             fflush(stderr)
-            Task { @MainActor in session.stop() }
+            Task { @MainActor in stopSession(session) }
         }
         return source
     }

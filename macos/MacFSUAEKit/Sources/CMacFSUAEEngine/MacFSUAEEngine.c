@@ -12,10 +12,12 @@ typedef struct Symbols {
     int (*start)(const fsuaemac_configuration *);
     int (*isRunning)(void);
     int (*getHealth)(fsuaemac_health *);
+    void (*clearException)(void);
     void (*stop)(void);
     int (*queueKey)(uint16_t, int32_t);
     int (*queueMouseMove)(int32_t, int32_t);
     int (*queueMouseButton)(uint32_t, int32_t);
+    int (*debugCommand)(const char *, char *, uint32_t, uint32_t);
     int (*setSpeed)(double);
     int (*queuePause)(int32_t);
     int (*queueReset)(int32_t);
@@ -54,10 +56,12 @@ int MacFSUAEEngineLoad(const char *path)
     LOAD(start, "fsuaemac_start");
     LOAD(isRunning, "fsuaemac_is_running");
     LOAD(getHealth, "fsuaemac_get_health");
+    LOAD(clearException, "fsuaemac_clear_exception");
     LOAD(stop, "fsuaemac_stop");
     LOAD(queueKey, "fsuaemac_queue_key");
     LOAD(queueMouseMove, "fsuaemac_queue_mouse_move");
     LOAD(queueMouseButton, "fsuaemac_queue_mouse_button");
+    LOAD(debugCommand, "fsuaemac_debug_command");
     LOAD(setSpeed, "fsuaemac_set_speed");
     LOAD(queuePause, "fsuaemac_queue_pause");
     LOAD(queueReset, "fsuaemac_queue_reset");
@@ -109,10 +113,12 @@ int MacFSUAEEngineStart(const fsuaemac_configuration *configuration)
 
 int MacFSUAEEngineIsRunning(void) { return symbols.isRunning ? symbols.isRunning() : 0; }
 int MacFSUAEEngineGetHealth(fsuaemac_health *health) { return symbols.getHealth ? symbols.getHealth(health) : 0; }
+void MacFSUAEEngineClearException(void) { if (symbols.clearException) symbols.clearException(); }
 void MacFSUAEEngineStop(void) { if (symbols.stop) symbols.stop(); }
 int MacFSUAEEngineQueueKey(uint16_t key, int32_t pressed) { return symbols.queueKey ? symbols.queueKey(key, pressed) : 0; }
 int MacFSUAEEngineQueueMouseMove(int32_t deltaX, int32_t deltaY) { return symbols.queueMouseMove ? symbols.queueMouseMove(deltaX, deltaY) : 0; }
 int MacFSUAEEngineQueueMouseButton(uint32_t button, int32_t pressed) { return symbols.queueMouseButton ? symbols.queueMouseButton(button, pressed) : 0; }
+int MacFSUAEEngineDebugCommand(const char *command, char *output, uint32_t outputSize, uint32_t timeoutMilliseconds) { return symbols.debugCommand ? symbols.debugCommand(command, output, outputSize, timeoutMilliseconds) : 0; }
 int MacFSUAEEngineSetSpeed(double multiplier) { return symbols.setSpeed ? symbols.setSpeed(multiplier) : 0; }
 int MacFSUAEEngineQueuePause(int32_t paused) { return symbols.queuePause ? symbols.queuePause(paused) : 0; }
 int MacFSUAEEngineQueueReset(int32_t hard) { return symbols.queueReset ? symbols.queueReset(hard) : 0; }

@@ -2184,8 +2184,20 @@ static void exception_trace (int nr)
 	regs.t1 = regs.t0 = regs.m = 0;
 }
 
+#if defined(__GNUC__)
+extern "C" void uae_cpu_exception_hook(int, uae_u32, uae_u32)
+    __attribute__((weak));
+#endif
+
 static void exception_debug (int nr)
 {
+#if defined(__GNUC__)
+	if (uae_cpu_exception_hook &&
+		(nr == 2 || nr == 3 || (nr >= 4 && nr <= 7) || nr == 14)) {
+		uae_cpu_exception_hook(nr, M68K_GETPC,
+			(nr == 2 || nr == 3) ? last_fault_for_exception_3 : 0);
+	}
+#endif
 #ifdef DEBUGGER
 	if (!exception_debugging)
 		return;

@@ -156,12 +156,16 @@ private struct EmulatorView: View {
         selected.flatMap { mcpServer.presentedMachine(configuration: $0.name) }
     }
 
+    private var selectedRunningMachine: MacFSUAERunningMachine? {
+        selected.flatMap { mcpServer.runningMachine(configuration: $0.name) }
+    }
+
     private var canEditSelected: Bool {
-        selected != nil && selectedMachine == nil
+        selected != nil && selectedRunningMachine == nil
     }
 
     private var canBootSelected: Bool {
-        selected != nil && selectedMachine == nil
+        selected != nil && selectedRunningMachine == nil
     }
 
     var body: some View {
@@ -250,7 +254,7 @@ private struct EmulatorView: View {
                             selectedID = configuration.url
                             editingConfiguration = configuration
                         }
-                        .disabled(mcpServer.presentedMachine(configuration: configuration.name) != nil)
+                        .disabled(mcpServer.runningMachine(configuration: configuration.name) != nil)
                         Button("Show in Finder") {
                             NSWorkspace.shared.activateFileViewerSelecting([configuration.url])
                         }
@@ -417,7 +421,10 @@ private struct EmulatorView: View {
                 }
             }
 
-            Text(selectedMachine?.status.capitalized ?? "Ready")
+            Text(selectedRunningMachine.map {
+                $0.presentation == "headless"
+                    ? "\($0.status.capitalized) Headless" : $0.status.capitalized
+            } ?? "Ready")
                 .foregroundStyle(.secondary)
 
             let headlessCount = mcpServer.runningMachines.count { $0.presentation == "headless" }

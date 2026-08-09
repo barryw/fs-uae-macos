@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Darwin
 import Foundation
@@ -23,6 +24,13 @@ public struct MacFSUAERunningMachine: Identifiable, Equatable, Sendable {
     public fileprivate(set) var speed = 1.0
     public fileprivate(set) var drives: [MacFSUAEDrive] = []
     public fileprivate(set) var guestControlReady = false
+    public fileprivate(set) var guestControlGeneration: UInt32 = 0
+    public fileprivate(set) var exceptionSequence: UInt64 = 0
+    public fileprivate(set) var exceptionVector: UInt32 = 0
+    public fileprivate(set) var exceptionPC: UInt32 = 0
+    public fileprivate(set) var exceptionAddress: UInt32 = 0
+    public fileprivate(set) var exceptionTask: UInt32 = 0
+    public fileprivate(set) var exceptionTaskName = ""
 }
 
 private struct MCPHTTPRequest: Sendable {
@@ -49,7 +57,6 @@ private final class MCPHTTPServer: @unchecked Sendable {
         parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: endpointPort)
         parameters.allowLocalEndpointReuse = true
         let listener = try NWListener(using: parameters)
-        listener.newConnectionLimit = 32
         listener.newConnectionHandler = { [weak self] connection in
             self?.accept(connection)
         }
@@ -57,8 +64,10 @@ private final class MCPHTTPServer: @unchecked Sendable {
             switch state {
             case .ready:
                 stateChanged(nil)
-            case let .failed(error), let .waiting(error):
+            case let .failed(error):
                 stateChanged(error.localizedDescription)
+            case .waiting:
+                break
             default:
                 break
             }
@@ -203,12 +212,21 @@ public final class MacFSUAEMCPServer: ObservableObject {
     private var workerFramePaths: [String: String] = [:]
     private var workerExchangePaths: [String: String] = [:]
     private enum GuestOperation { case command, put, get }
-    private struct GuestRequest { let machineID: String; let operation: GuestOperation }
+    private struct GuestRequest {
+        let machineID: String
+        let operation: GuestOperation
+        let started: Date
+        var timedOut = false
+    }
     private var guestCommands: [String: GuestRequest] = [:]
     private var guestCommandByMachine: [String: String] = [:]
     private var workerOutputBuffers: [String: String] = [:]
     private var workerHealthDates: [String: Date] = [:]
+    private var workerGuestHeartbeatDates: [String: Date] = [:]
+    private var workerGuestHeartbeats: [String: UInt32] = [:]
+    private var workerResetGenerationBaselines: [String: UInt32] = [:]
     private var workerAlertBaselines: [String: [UInt32]] = [:]
+    private var debuggerMachines: Set<String> = []
     private var foregroundMachineID: String?
     private var foregroundAlertBaseline: [UInt32]?
     private var selectedPresentedMachineID: String?
@@ -286,9 +304,16 @@ public final class MacFSUAEMCPServer: ObservableObject {
         runningMachines.first { $0.configuration == configuration && $0.presentation == "headed" }
     }
 
+    public func runningMachine(configuration: String) -> MacFSUAERunningMachine? {
+        runningMachines.first { $0.configuration == configuration }
+    }
+
     @discardableResult
     public func startPresented(_ configuration: FSUAEConfiguration) throws -> MacFSUAERunningMachine {
         if let existing = presentedMachine(configuration: configuration.name) { return existing }
+        if runningMachine(configuration: configuration.name) != nil {
+            throw MCPFailure("\(configuration.name) is already running headless")
+        }
         return try startWorker(configuration, presentation: "headed")
     }
 
@@ -373,6 +398,13 @@ public final class MacFSUAEMCPServer: ObservableObject {
                     if let error {
                         self.isRunning = false
                         self.status = error
+                        self.httpServer?.stop()
+                        self.httpServer = nil
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                            guard let self, self.isEnabled, !self.isRunning,
+                                  self.httpServer == nil else { return }
+                            self.startServer()
+                        }
                     } else {
                         self.isRunning = true
                         self.status = "Listening"
@@ -393,7 +425,7 @@ public final class MacFSUAEMCPServer: ObservableObject {
         status = "Off"
     }
 
-    func handleMCPRequest(_ data: Data) -> MCPHTTPReply {
+    func handleMCPRequest(_ data: Data) async -> MCPHTTPReply {
         let request: [String: Any]
         do {
             guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -430,8 +462,10 @@ public final class MacFSUAEMCPServer: ObservableObject {
             }
             let arguments = params["arguments"] as? [String: Any] ?? [:]
             do {
-                let text = try callTool(name, arguments: arguments)
-                return success(id: id, result: toolResult(text))
+                let result = name == "fsuae_screen_capture"
+                    ? try screenCaptureToolResult(arguments)
+                    : toolResult(try await callTool(name, arguments: arguments))
+                return success(id: id, result: result)
             } catch let error as MCPUnknownTool {
                 return failure(id: id, code: -32602, message: error.localizedDescription)
             } catch {
@@ -454,14 +488,56 @@ public final class MacFSUAEMCPServer: ObservableObject {
              "required": required, "additionalProperties": false]
         }
         return [
-            tool("fsuae_machine_start", "Start a machine using an exact saved configuration name.",
-                 stringSchema(["configuration": "Saved configuration name"],
-                              required: ["configuration"])),
+            tool("fsuae_machine_start", "Start a machine using an exact saved configuration name. Optionally replace its startup floppy set; an empty array boots with all floppies ejected.", [
+                "type": "object",
+                "properties": [
+                    "configuration": ["type": "string", "description": "Saved configuration name"],
+                    "floppies": ["type": "array", "maxItems": 4,
+                                  "items": ["type": "string"],
+                                  "description": "Exact DF0-DF3 startup paths; omitted drives are ejected"],
+                ],
+                "required": ["configuration"], "additionalProperties": false,
+            ]),
             tool("fsuae_machine_stop", "Stop a machine by machine id or configuration name. Omit both when only one machine is running.",
                  stringSchema(["machine_id": "Machine UUID returned by start",
                                "configuration": "Exact saved configuration name"],
                               required: [])),
             tool("fsuae_machines_list", "List running machines, their UUIDs, configurations, presentation modes, and statuses.", empty),
+            tool("fsuae_machine_wait", "Wait until Workbench is open and ready for interaction, without relying on a fixed boot delay.", [
+                "type": "object",
+                "properties": [
+                    "machine_id": ["type": "string", "description": "Running machine UUID"],
+                    "condition": ["type": "string", "enum": ["workbench"],
+                                  "description": "Readiness condition"],
+                    "timeout_seconds": ["type": "integer", "minimum": 1, "maximum": 300,
+                                        "default": 120],
+                ],
+                "required": ["machine_id", "condition"], "additionalProperties": false,
+            ]),
+            tool("fsuae_floppy_set", "Insert or eject a floppy in a running machine. Omit path to eject the selected drive.", [
+                "type": "object",
+                "properties": [
+                    "machine_id": ["type": "string", "description": "Running machine UUID"],
+                    "drive": ["type": "integer", "minimum": 0, "maximum": 3,
+                              "description": "Floppy drive number: 0 is DF0"],
+                    "path": ["type": "string", "description": "Readable host ADF path; omit to eject"],
+                ],
+                "required": ["machine_id", "drive"], "additionalProperties": false,
+            ]),
+            tool("fsuae_machine_reset", "Reset one machine. A hard reset also clears a timed-out or faulted guest command so automation can recover deterministically.", [
+                "type": "object",
+                "properties": [
+                    "machine_id": ["type": "string", "description": "Running machine UUID"],
+                    "hard": ["type": "boolean", "default": true],
+                ],
+                "required": ["machine_id"], "additionalProperties": false,
+            ]),
+            tool("fsuae_machine_diagnostics", "Return one machine's health, timed-out guest request, Guru alert data, CPU registers, instruction history, and Exec task state.",
+                 stringSchema(["machine_id": "Running machine UUID"],
+                              required: ["machine_id"])),
+            tool("fsuae_screen_capture", "Capture the latest visible Amiga frame as a cropped PNG image. Works for headed and headless machines.",
+                 stringSchema(["machine_id": "Running machine UUID"],
+                              required: ["machine_id"])),
             tool("fsuae_configurations_list", "List saved FS-UAE configurations and models.", empty),
             tool("fsuae_exchange_put", "Place a base64-encoded file on a machine's drive-independent MCP: volume.",
                  stringSchema(["machine_id": "Running machine UUID",
@@ -476,9 +552,26 @@ public final class MacFSUAEMCPServer: ObservableObject {
                  stringSchema(["machine_id": "Running machine UUID",
                                "command": "AmigaDOS command line (4095-byte maximum)"],
                               required: ["machine_id", "command"])),
+            tool("fsuae_command_execute", "Run a program or AmigaDOS command, wait for completion, and return captured output and a truthful exit-code status.", [
+                "type": "object",
+                "properties": [
+                    "machine_id": ["type": "string", "description": "Running machine UUID"],
+                    "command": ["type": "string", "description": "Program or AmigaDOS command line (4095-byte maximum)"],
+                    "timeout_seconds": ["type": "integer", "minimum": 1, "maximum": 300,
+                                        "default": 30, "description": "Maximum wait before returning a pollable request id"],
+                ],
+                "required": ["machine_id", "command"], "additionalProperties": false,
+            ]),
             tool("fsuae_command_result", "Poll a guest command request for captured output.",
                  stringSchema(["request_id": "Request UUID returned by fsuae_command_run"],
                               required: ["request_id"])),
+            tool("fsuae_debug_command", "Execute one built-in UAE debugger command at an emulator-thread boundary. Use breakpoints before launching a program, then inspect or step it without terminal interaction.",
+                 stringSchema(["machine_id": "Running machine UUID",
+                               "command": "UAE debugger command, for example r, d ADDRESS, m ADDRESS, f ADDRESS, t, z, or g"],
+                              required: ["machine_id", "command"])),
+            tool("fsuae_debug_snapshot", "Capture CPU registers, recent instruction history, and Exec task state in one debugger-safe operation.",
+                 stringSchema(["machine_id": "Running machine UUID"],
+                              required: ["machine_id"])),
             tool("fsuae_file_put", "Write a base64-encoded file to any AmigaDOS path through the guest service.",
                  stringSchema(["machine_id": "Running machine UUID",
                                "path": "Destination AmigaDOS path",
@@ -511,7 +604,7 @@ public final class MacFSUAEMCPServer: ObservableObject {
         ["name": name, "description": description, "inputSchema": schema]
     }
 
-    private func callTool(_ name: String, arguments: [String: Any]) throws -> String {
+    private func callTool(_ name: String, arguments: [String: Any]) async throws -> String {
         library.reload()
         switch name {
         case "fsuae_machine_start":
@@ -519,13 +612,23 @@ public final class MacFSUAEMCPServer: ObservableObject {
             guard let configuration = library.configuration(named: requested) else {
                 throw MCPFailure("No configuration named \(requested)")
             }
+            let floppies = try floppyPaths(in: arguments)
             let machine = try startWorker(configuration,
-                                          presentation: isHeadless ? "headless" : "headed")
+                                          presentation: isHeadless ? "headless" : "headed",
+                                          floppies: floppies)
             return "Started \(configuration.name) (\(configuration.model)); machine_id \(machine.id); pid \(machine.processIdentifier)"
         case "fsuae_machine_stop":
             return try stopMachine(arguments)
         case "fsuae_machines_list":
             return try machinesJSON()
+        case "fsuae_machine_wait":
+            return try await waitForMachine(arguments)
+        case "fsuae_floppy_set":
+            return try await setFloppy(arguments)
+        case "fsuae_machine_reset":
+            return try resetMachine(arguments)
+        case "fsuae_machine_diagnostics":
+            return try await machineDiagnostics(arguments)
         case "fsuae_configurations_list":
             let rows = library.configurations.map { configuration in
                 let sessions = runningMachines.filter {
@@ -545,13 +648,19 @@ public final class MacFSUAEMCPServer: ObservableObject {
         case "fsuae_exchange_get":
             return try exchangeGet(arguments)
         case "fsuae_command_run":
-            return try guestCommandRun(arguments)
+            return try await guestCommandRun(arguments)
+        case "fsuae_command_execute":
+            return try await guestCommandExecute(arguments)
         case "fsuae_command_result":
             return try guestCommandResult(arguments)
+        case "fsuae_debug_command":
+            return try await debuggerExecute(arguments, snapshot: false)
+        case "fsuae_debug_snapshot":
+            return try await debuggerExecute(arguments, snapshot: true)
         case "fsuae_file_put":
-            return try guestFilePut(arguments)
+            return try await guestFilePut(arguments)
         case "fsuae_file_get":
-            return try guestFileGet(arguments)
+            return try await guestFileGet(arguments)
         case "fsuae_configuration_add":
             let name = try requiredString("name", in: arguments)
             let model = arguments["model"] as? String ?? "A500"
@@ -579,7 +688,8 @@ public final class MacFSUAEMCPServer: ObservableObject {
     }
 
     private func startWorker(_ configuration: FSUAEConfiguration,
-                             presentation: String) throws -> MacFSUAERunningMachine {
+                             presentation: String,
+                             floppies: [String]? = nil) throws -> MacFSUAERunningMachine {
         guard let executable = workerExecutable else {
             throw MCPFailure("FS-UAE Worker is missing")
         }
@@ -596,12 +706,13 @@ public final class MacFSUAEMCPServer: ObservableObject {
                 try FileManager.default.createDirectory(atPath: path,
                                                         withIntermediateDirectories: false,
                                                         attributes: [.posixPermissions: 0o700])
-                if let diagnostic = Bundle.main.url(forResource: "FSUAE-Diag",
-                                                     withExtension: nil,
-                                                     subdirectory: "Amiga") {
-                    try FileManager.default.copyItem(at: diagnostic,
-                                                     to: URL(fileURLWithPath: path)
-                                                        .appendingPathComponent("FSUAE-Diag"))
+                for tool in ["FSUAE-Diag", "FSUAE-WaitWB"] {
+                    if let source = Bundle.main.url(forResource: tool, withExtension: nil,
+                                                    subdirectory: "Amiga") {
+                        try FileManager.default.copyItem(at: source,
+                                                         to: URL(fileURLWithPath: path)
+                                                            .appendingPathComponent(tool))
+                    }
                 }
             } catch {
                 try? FileManager.default.removeItem(atPath: path)
@@ -610,17 +721,17 @@ public final class MacFSUAEMCPServer: ObservableObject {
             exchangePath = path
             environment["FSUAE_MAC_EXCHANGE_DIRECTORY"] = path
         }
-        var transport: MacFSUAEFrameTransport?
-        var framePath: String?
-        if presentation == "headed" {
-            let path = FileManager.default.temporaryDirectory
-                .appendingPathComponent("fsuae-\(id).frame").path
-            guard let created = MacFSUAEFrameTransport(creating: path) else {
-                throw MCPFailure("Could not create the display channel")
+        let framePath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fsuae-\(id).frame").path
+        guard let transport = MacFSUAEFrameTransport(creating: framePath) else {
+            throw MCPFailure("Could not create the display channel")
+        }
+        environment["FSUAE_MAC_FRAME_FILE"] = framePath
+        if let floppies {
+            for drive in 0..<4 {
+                environment["FSUAE_MAC_FLOPPY_\(drive)"] = drive < floppies.count
+                    ? floppies[drive] : ""
             }
-            transport = created
-            framePath = path
-            environment["FSUAE_MAC_FRAME_FILE"] = path
         }
         if environment["FSUAE_MAC_RUNTIME"] == nil,
            let runtime = Bundle.main.privateFrameworksURL?
@@ -646,7 +757,7 @@ public final class MacFSUAEMCPServer: ObservableObject {
         do {
             try process.run()
         } catch {
-            if let framePath { try? FileManager.default.removeItem(atPath: framePath) }
+            try? FileManager.default.removeItem(atPath: framePath)
             if let exchangePath { try? FileManager.default.removeItem(atPath: exchangePath) }
             throw MCPFailure("Could not start FS-UAE Worker: \(error.localizedDescription)")
         }
@@ -661,11 +772,9 @@ public final class MacFSUAEMCPServer: ObservableObject {
         workerInputPipes[id] = inputPipe
         workerStatusPipes[id] = statusPipe
         if let exchangePath { workerExchangePaths[id] = exchangePath }
-        if let transport, let framePath {
-            workerTransports[id] = transport
-            workerFrameSources[id] = MacFSUAEFrameSource(transport: transport)
-            workerFramePaths[id] = framePath
-        }
+        workerTransports[id] = transport
+        workerFrameSources[id] = MacFSUAEFrameSource(transport: transport)
+        workerFramePaths[id] = framePath
         workerOutputBuffers[id] = ""
         workerHealthDates[id] = Date()
         runningMachines.append(machine)
@@ -765,14 +874,15 @@ public final class MacFSUAEMCPServer: ObservableObject {
         guestCommandByMachine.removeAll()
         workerOutputBuffers.removeAll()
         workerHealthDates.removeAll()
+        workerGuestHeartbeatDates.removeAll()
+        workerGuestHeartbeats.removeAll()
+        workerResetGenerationBaselines.removeAll()
         workerAlertBaselines.removeAll()
         runningMachines.removeAll()
     }
 
     private func removeWorker(_ id: String) {
-        if let request = guestCommandByMachine.removeValue(forKey: id) {
-            guestCommands[request] = nil
-        }
+        clearGuestRequest(id)
         workerProcesses[id] = nil
         workerInputPipes[id] = nil
         workerStatusPipes[id]?.fileHandleForReading.readabilityHandler = nil
@@ -787,9 +897,24 @@ public final class MacFSUAEMCPServer: ObservableObject {
         }
         workerOutputBuffers[id] = nil
         workerHealthDates[id] = nil
+        workerGuestHeartbeatDates[id] = nil
+        workerGuestHeartbeats[id] = nil
+        workerResetGenerationBaselines[id] = nil
         workerAlertBaselines[id] = nil
         runningMachines.removeAll { $0.id == id }
         if selectedPresentedMachineID == id { selectedPresentedMachineID = nil }
+    }
+
+    private func clearGuestRequest(_ machineID: String) {
+        if let request = guestCommandByMachine.removeValue(forKey: machineID) {
+            guestCommands[request] = nil
+        }
+        guard let path = workerExchangePaths[machineID] else { return }
+        let directory = URL(fileURLWithPath: path, isDirectory: true)
+        for name in ["FSUAE-Control-Command", "FSUAE-Control-Output",
+                     "FSUAE-Control-Status", "FSUAE-Control-Transfer"] {
+            try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
+        }
     }
 
     private func sendWorkerCommand(_ id: String, _ command: [String: Any]) -> Bool {
@@ -841,10 +966,17 @@ public final class MacFSUAEMCPServer: ObservableObject {
     }
 
     private func consumeHealth(_ id: String, fields: [Substring]) {
-        guard fields.count == 9,
+        guard fields.count == 17,
               let sequence = UInt64(fields[1]),
               let pc = UInt32(fields[2]),
-              let execBase = UInt32(fields[3]) else { return }
+              let execBase = UInt32(fields[3]),
+              let guestHeartbeat = UInt32(fields[9]),
+              let guestGeneration = UInt32(fields[10]),
+              let exceptionSequence = UInt64(fields[11]),
+              let exceptionVector = UInt32(fields[12]),
+              let exceptionPC = UInt32(fields[13]),
+              let exceptionAddress = UInt32(fields[14]),
+              let exceptionTask = UInt32(fields[15]) else { return }
         let alert = fields[4...7].compactMap { UInt32($0) }
         guard alert.count == 4,
               let index = runningMachines.firstIndex(where: { $0.id == id }) else { return }
@@ -852,10 +984,32 @@ public final class MacFSUAEMCPServer: ObservableObject {
         runningMachines[index].programCounter = pc
         runningMachines[index].execBase = execBase
         runningMachines[index].lastAlert = alert
-        runningMachines[index].guestControlReady = fields[8] == "1"
-        workerHealthDates[id] = Date()
+        runningMachines[index].exceptionSequence = exceptionSequence
+        runningMachines[index].exceptionVector = exceptionVector
+        runningMachines[index].exceptionPC = exceptionPC
+        runningMachines[index].exceptionAddress = exceptionAddress
+        runningMachines[index].exceptionTask = exceptionTask
+        runningMachines[index].exceptionTaskName = fields[16] == "-" ? "" :
+            Data(base64Encoded: String(fields[16])).map { String(decoding: $0, as: UTF8.self) } ?? ""
+        runningMachines[index].guestControlGeneration = guestGeneration
+        let now = Date()
+        if workerGuestHeartbeats[id] != guestHeartbeat {
+            workerGuestHeartbeats[id] = guestHeartbeat
+            workerGuestHeartbeatDates[id] = now
+        }
+        let resetPending: Bool
+        if let baseline = workerResetGenerationBaselines[id], guestGeneration != baseline {
+            workerResetGenerationBaselines[id] = nil
+            resetPending = false
+        } else {
+            resetPending = workerResetGenerationBaselines[id] != nil
+        }
+        runningMachines[index].guestControlReady = !resetPending && fields[8] == "1" &&
+            now.timeIntervalSince(workerGuestHeartbeatDates[id] ?? now) < 3
+        workerHealthDates[id] = now
         if execBase != 0 {
-            if let baseline = workerAlertBaselines[id], alert != baseline, alert[0] != 0 {
+            if let baseline = workerAlertBaselines[id], alert != baseline,
+               alert[0] != 0, alert[0] != UInt32.max {
                 runningMachines[index].status = "guruing"
             } else if workerAlertBaselines[id] == nil {
                 workerAlertBaselines[id] = alert
@@ -880,7 +1034,8 @@ public final class MacFSUAEMCPServer: ObservableObject {
                 if health.execBase != 0 {
                     row["exec_base"] = String(format: "0x%08x", health.execBase)
                     if foregroundAlertBaseline == nil { foregroundAlertBaseline = health.lastAlert }
-                    if health.lastAlert != foregroundAlertBaseline, health.lastAlert[0] != 0 {
+                    if health.lastAlert != foregroundAlertBaseline,
+                       health.lastAlert[0] != 0, health.lastAlert[0] != UInt32.max {
                         row["status"] = "guruing"
                         row["last_alert"] = health.lastAlert.map {
                             String(format: "0x%08x", $0)
@@ -897,9 +1052,12 @@ public final class MacFSUAEMCPServer: ObservableObject {
 
     private func machineRow(_ machine: MacFSUAERunningMachine) -> [String: Any] {
         let heartbeatAge = workerHealthDates[machine.id].map { Date().timeIntervalSince($0) }
+        let guestControlAge = workerGuestHeartbeatDates[machine.id].map {
+            Date().timeIntervalSince($0)
+        }
         let stale = (machine.status == "running" && (heartbeatAge ?? 0) > 3) ||
             (machine.status == "booting" && (heartbeatAge ?? 0) > 10)
-        let status = stale ? "unresponsive" : machine.status
+        var status = stale ? "unresponsive" : machine.status
         var row: [String: Any] = [
             "machine_id": machine.id, "configuration": machine.configuration,
             "model": machine.model, "pid": machine.processIdentifier,
@@ -907,14 +1065,241 @@ public final class MacFSUAEMCPServer: ObservableObject {
             "frame_sequence": machine.frameSequence,
             "program_counter": String(format: "0x%08x", machine.programCounter),
             "guest_control_ready": machine.guestControlReady,
+            "guest_control_generation": machine.guestControlGeneration,
         ]
+        if let heartbeatAge { row["health_age_seconds"] = heartbeatAge }
+        if let guestControlAge { row["guest_control_age_seconds"] = guestControlAge }
+        if machine.exceptionSequence != 0 {
+            var exception: [String: Any] = [
+                "sequence": machine.exceptionSequence,
+                "vector": machine.exceptionVector,
+                "name": exceptionName(machine.exceptionVector),
+                "faulting_pc": String(format: "0x%08x", machine.exceptionPC),
+                "task": String(format: "0x%08x", machine.exceptionTask),
+            ]
+            if machine.exceptionAddress != 0 {
+                exception["fault_address"] = String(format: "0x%08x",
+                                                      machine.exceptionAddress)
+            }
+            if !machine.exceptionTaskName.isEmpty {
+                exception["task_name"] = machine.exceptionTaskName
+            }
+            row["cpu_exception"] = exception
+        }
+        if let requestID = guestCommandByMachine[machine.id],
+           let request = guestCommands[requestID] {
+            row["guest_request_id"] = requestID
+            row["guest_command_age_seconds"] = Date().timeIntervalSince(request.started)
+            row["guest_command_status"] = request.timedOut ? "timeout" : "running"
+            if request.timedOut, status != "guruing" {
+                status = machine.exceptionSequence == 0
+                    ? "guest_command_timed_out" : "guest_crashed"
+                row["status"] = status
+            }
+        }
         if machine.execBase != 0 {
             row["exec_base"] = String(format: "0x%08x", machine.execBase)
-            if status == "guruing" {
+            if machine.lastAlert[0] != 0, machine.lastAlert[0] != UInt32.max {
                 row["last_alert"] = machine.lastAlert.map { String(format: "0x%08x", $0) }
             }
         }
         return row
+    }
+
+    private func exceptionName(_ vector: UInt32) -> String {
+        switch vector {
+        case 2: "bus_error"
+        case 3: "address_error"
+        case 4: "illegal_instruction"
+        case 5: "division_by_zero"
+        case 6: "chk"
+        case 7: "trapv"
+        case 8: "privilege_violation"
+        case 10: "line_a"
+        case 11: "line_f"
+        case 14: "format_error"
+        default: "exception_\(vector)"
+        }
+    }
+
+    private func machineDiagnostics(_ arguments: [String: Any]) async throws -> String {
+        let machineID = try requiredString("machine_id", in: arguments)
+        guard let machine = runningMachines.first(where: { $0.id == machineID }) else {
+            throw MCPFailure("No running machine \(machineID)")
+        }
+        var result = machineRow(machine)
+        let debugger = try await debuggerExecute(["machine_id": machineID], snapshot: true)
+        if let data = debugger.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data) {
+            result["debugger"] = object
+        }
+        return try jsonText(result)
+    }
+
+    private func waitForMachine(_ arguments: [String: Any]) async throws -> String {
+        let machineID = try requiredString("machine_id", in: arguments)
+        guard try requiredString("condition", in: arguments) == "workbench" else {
+            throw MCPFailure("condition must be workbench")
+        }
+        let timeout = arguments["timeout_seconds"] as? Int ?? 120
+        guard (1...300).contains(timeout) else {
+            throw MCPFailure("timeout_seconds must be between 1 and 300")
+        }
+        guard workerProcesses[machineID]?.isRunning == true else {
+            throw MCPFailure("No running machine \(machineID)")
+        }
+
+        let started = Date()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(timeout))
+        while runningMachines.first(where: { $0.id == machineID })?.guestControlReady != true {
+            guard workerProcesses[machineID]?.isRunning == true else {
+                throw MCPFailure("Machine \(machineID) stopped while booting")
+            }
+            if runningMachines.first(where: { $0.id == machineID })?.status == "guruing" {
+                throw MCPFailure("Machine \(machineID) entered a Guru Meditation while booting")
+            }
+            guard ContinuousClock.now < deadline else {
+                throw MCPFailure("Workbench did not become ready within \(timeout) seconds; guest control never became available")
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+
+        while ContinuousClock.now < deadline {
+            let remaining = max(1, Int(started.addingTimeInterval(TimeInterval(timeout))
+                .timeIntervalSinceNow.rounded(.down)))
+            do {
+                let response = try await guestCommandExecute([
+                    "machine_id": machineID,
+                    "command": "MCP:FSUAE-WaitWB \(remaining)",
+                    "timeout_seconds": remaining,
+                ])
+                if let data = response.data(using: .utf8),
+                   let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    if result["status"] as? String == "timeout" {
+                        throw MCPFailure("Workbench did not become ready within \(timeout) seconds")
+                    }
+                    guard (result["output"] as? String)?.contains("WORKBENCH_READY") == true else {
+                        try await Task.sleep(for: .milliseconds(50))
+                        continue
+                    }
+                    let heartbeat = workerGuestHeartbeats[machineID]
+                    try await waitForGuestControl(machineID, after: heartbeat)
+                    return try jsonText(["machine_id": machineID, "condition": "workbench",
+                                         "status": "ready",
+                                         "elapsed_seconds": Date().timeIntervalSince(started)])
+                }
+            } catch let failure as MCPFailure
+                where failure.message.hasPrefix("Guest control is not ready") {
+                // The new guest process can exist briefly before DOS can launch tools.
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw MCPFailure("Workbench did not become ready within \(timeout) seconds")
+    }
+
+    private func setFloppy(_ arguments: [String: Any]) async throws -> String {
+        let machineID = try requiredString("machine_id", in: arguments)
+        guard let drive = arguments["drive"] as? Int, (0...3).contains(drive) else {
+            throw MCPFailure("drive must be between 0 and 3")
+        }
+        let path = try validatedFloppyPath(arguments["path"] as? String ?? "")
+        guard workerProcesses[machineID]?.isRunning == true,
+              sendWorkerCommand(machineID, ["command": "floppy", "drive": drive,
+                                             "path": path]) else {
+            throw MCPFailure("No running machine \(machineID)")
+        }
+        if path.isEmpty,
+           runningMachines.first(where: { $0.id == machineID })?.drives
+            .contains(where: { $0.kind == .floppy && $0.index == drive }) != true {
+            return try jsonText(["machine_id": machineID, "drive": "DF\(drive)",
+                                 "status": "ejected"])
+        }
+
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        repeat {
+            if let mounted = runningMachines.first(where: { $0.id == machineID })?.drives
+                .first(where: { $0.kind == .floppy && $0.index == drive })?.mediaPath,
+               mounted == path {
+                return try jsonText(["machine_id": machineID, "drive": "DF\(drive)",
+                                     "status": path.isEmpty ? "ejected" : "inserted",
+                                     "path": path])
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        } while ContinuousClock.now < deadline
+        throw MCPFailure("DF\(drive) did not acknowledge the media change")
+    }
+
+    private func resetMachine(_ arguments: [String: Any]) throws -> String {
+        let machineID = try requiredString("machine_id", in: arguments)
+        let hard = arguments["hard"] as? Bool ?? true
+        guard workerProcesses[machineID]?.isRunning == true,
+              sendWorkerCommand(machineID, ["command": "reset", "hard": hard]) else {
+            throw MCPFailure("No running machine \(machineID)")
+        }
+        if let index = runningMachines.firstIndex(where: { $0.id == machineID }) {
+            workerResetGenerationBaselines[machineID] =
+                runningMachines[index].guestControlGeneration
+            runningMachines[index].guestControlReady = false
+        }
+        clearGuestRequest(machineID)
+        return try jsonText(["machine_id": machineID,
+                             "status": hard ? "hard_reset" : "reset"])
+    }
+
+    private func floppyPaths(in arguments: [String: Any]) throws -> [String]? {
+        guard let value = arguments["floppies"] else { return nil }
+        guard let paths = value as? [String], paths.count <= 4 else {
+            throw MCPFailure("floppies must contain at most four paths")
+        }
+        return try paths.map(validatedFloppyPath)
+    }
+
+    private func validatedFloppyPath(_ path: String) throws -> String {
+        guard !path.contains("\0") else { throw MCPFailure("Floppy path contains a NUL byte") }
+        guard !path.isEmpty else { return "" }
+        guard path.hasPrefix("/"), FileManager.default.isReadableFile(atPath: path) else {
+            throw MCPFailure("Floppy path must be an absolute, readable file")
+        }
+        return path
+    }
+
+    private func screenCaptureToolResult(_ arguments: [String: Any]) throws -> [String: Any] {
+        let machineID = try requiredString("machine_id", in: arguments)
+        guard workerProcesses[machineID]?.isRunning == true,
+              let frame = workerFrameSources[machineID]?.latest(after: 0) else {
+            throw MCPFailure("No video frame is available for machine \(machineID)")
+        }
+        let bounds = CGRect(x: 0, y: 0, width: frame.width, height: frame.height)
+        let requested = frame.crop.isEmpty ? bounds : frame.crop
+        let crop = requested.integral.intersection(bounds)
+        let x = Int(crop.minX), y = Int(crop.minY)
+        let width = Int(crop.width), height = Int(crop.height)
+        guard width > 0, height > 0 else { throw MCPFailure("Video crop is empty") }
+
+        var pixels = Data(capacity: width * height * 4)
+        for row in y..<(y + height) {
+            let start = row * frame.stride + x * 4
+            pixels.append(frame.pixels[start..<(start + width * 4)])
+        }
+        guard let provider = CGDataProvider(data: pixels as CFData),
+              let image = CGImage(
+                width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: .byteOrder32Little.union(
+                    CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue)),
+                provider: provider, decode: nil, shouldInterpolate: false,
+                intent: .defaultIntent),
+              let png = NSBitmapImageRep(cgImage: image)
+                .representation(using: .png, properties: [:]) else {
+            throw MCPFailure("Could not encode the video frame")
+        }
+        let metadata = try jsonText(["machine_id": machineID, "width": width,
+                                     "height": height, "sequence": frame.sequence,
+                                     "rtg": frame.isRTG])
+        return ["content": [
+            ["type": "image", "data": png.base64EncodedString(), "mimeType": "image/png"],
+            ["type": "text", "text": metadata],
+        ], "isError": false]
     }
 
     private func exchangePut(_ arguments: [String: Any]) throws -> String {
@@ -945,32 +1330,62 @@ public final class MacFSUAEMCPServer: ObservableObject {
                              "size": data.count, "data_base64": data.base64EncodedString()])
     }
 
-    private func guestCommandRun(_ arguments: [String: Any]) throws -> String {
+    private func guestCommandRun(_ arguments: [String: Any]) async throws -> String {
         let machineID = try requiredString("machine_id", in: arguments)
         let command = try requiredString("command", in: arguments)
         guard let data = command.data(using: .isoLatin1), !data.contains(0), data.count <= 4095 else {
             throw MCPFailure("command must be Latin-1 text of 4095 bytes or less")
         }
-        return try startGuestRequest(machineID: machineID, payload: Data([0x43]) + data,
-                                     operation: .command)
+        return try await startGuestRequest(machineID: machineID,
+                                           payload: Data([0x43]) + data,
+                                           operation: .command)
     }
 
-    private func guestFilePut(_ arguments: [String: Any]) throws -> String {
+    private func guestCommandExecute(_ arguments: [String: Any]) async throws -> String {
+        let machineID = try requiredString("machine_id", in: arguments)
+        let timeout = arguments["timeout_seconds"] as? Int ?? 30
+        guard (1...300).contains(timeout) else {
+            throw MCPFailure("timeout_seconds must be between 1 and 300")
+        }
+        _ = try await guestCommandRun(arguments)
+        guard let request = guestCommandByMachine[machineID] else {
+            throw MCPFailure("Could not start command on machine \(machineID)")
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(timeout))
+        repeat {
+            let statusURL = try exchangeURL(machineID: machineID,
+                                            name: "FSUAE-Control-Status")
+            if let status = try? Data(contentsOf: statusURL), status.count >= 6 {
+                return try guestCommandResult(["request_id": request])
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        } while ContinuousClock.now < deadline
+        if var guestRequest = guestCommands[request] {
+            guestRequest.timedOut = true
+            guestCommands[request] = guestRequest
+        }
+        return try jsonText(["machine_id": machineID, "request_id": request,
+                             "status": "timeout",
+                             "message": "Command did not complete; inspect diagnostics, then hard-reset the machine to recover"])
+    }
+
+    private func guestFilePut(_ arguments: [String: Any]) async throws -> String {
         let machineID = try requiredString("machine_id", in: arguments)
         let path = try guestPath(in: arguments)
         let encoded = try requiredString("data_base64", in: arguments)
         guard let data = Data(base64Encoded: encoded), data.count <= 16 * 1_048_576 else {
             throw MCPFailure("data_base64 must contain at most 16 MiB")
         }
-        return try startGuestRequest(machineID: machineID, payload: Data([0x50]) + path,
-                                     operation: .put, transfer: data)
+        return try await startGuestRequest(machineID: machineID,
+                                           payload: Data([0x50]) + path,
+                                           operation: .put, transfer: data)
     }
 
-    private func guestFileGet(_ arguments: [String: Any]) throws -> String {
+    private func guestFileGet(_ arguments: [String: Any]) async throws -> String {
         let machineID = try requiredString("machine_id", in: arguments)
-        return try startGuestRequest(machineID: machineID,
-                                     payload: Data([0x47]) + guestPath(in: arguments),
-                                     operation: .get)
+        return try await startGuestRequest(machineID: machineID,
+                                           payload: Data([0x47]) + guestPath(in: arguments),
+                                           operation: .get)
     }
 
     private func guestPath(in arguments: [String: Any]) throws -> Data {
@@ -982,10 +1397,9 @@ public final class MacFSUAEMCPServer: ObservableObject {
     }
 
     private func startGuestRequest(machineID: String, payload: Data,
-                                   operation: GuestOperation, transfer: Data? = nil) throws -> String {
-        guard runningMachines.first(where: { $0.id == machineID })?.guestControlReady == true else {
-            throw MCPFailure("Guest control is not ready on machine \(machineID)")
-        }
+                                   operation: GuestOperation,
+                                   transfer: Data? = nil) async throws -> String {
+        try await waitForGuestControl(machineID)
         guard guestCommandByMachine[machineID] == nil else {
             throw MCPFailure("Machine \(machineID) already has an uncollected command")
         }
@@ -1000,12 +1414,32 @@ public final class MacFSUAEMCPServer: ObservableObject {
         } else {
             try? FileManager.default.removeItem(at: transferURL)
         }
+        guard sendWorkerCommand(machineID, ["command": "clear_exception"]) else {
+            throw MCPFailure("Could not prepare guest command on machine \(machineID)")
+        }
         try payload.write(to: commandURL, options: .atomic)
         let request = UUID().uuidString.lowercased()
-        guestCommands[request] = GuestRequest(machineID: machineID, operation: operation)
+        guestCommands[request] = GuestRequest(machineID: machineID,
+                                              operation: operation, started: Date())
         guestCommandByMachine[machineID] = request
         return try jsonText(["machine_id": machineID, "request_id": request,
                              "status": "running"])
+    }
+
+    private func waitForGuestControl(_ machineID: String,
+                                     after heartbeat: UInt32? = nil) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        repeat {
+            guard workerProcesses[machineID]?.isRunning == true else {
+                throw MCPFailure("No running machine \(machineID)")
+            }
+            if runningMachines.first(where: { $0.id == machineID })?.guestControlReady == true,
+               heartbeat == nil || workerGuestHeartbeats[machineID] != heartbeat {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        } while ContinuousClock.now < deadline
+        throw MCPFailure("Guest control is not ready on machine \(machineID)")
     }
 
     private func guestCommandResult(_ arguments: [String: Any]) throws -> String {
@@ -1015,7 +1449,13 @@ public final class MacFSUAEMCPServer: ObservableObject {
         }
         let machineID = guestRequest.machineID
         let statusURL = try exchangeURL(machineID: machineID, name: "FSUAE-Control-Status")
-        guard let status = try? Data(contentsOf: statusURL), let byte = status.first else {
+        guard let status = try? Data(contentsOf: statusURL), status.count >= 6,
+              let byte = status.first else {
+            if guestRequest.timedOut {
+                return try jsonText(["machine_id": machineID, "request_id": request,
+                                     "status": "timeout",
+                                     "message": "Inspect diagnostics, then hard-reset the machine to recover"])
+            }
             return try jsonText(["machine_id": machineID, "request_id": request,
                                  "status": "running"])
         }
@@ -1028,8 +1468,14 @@ public final class MacFSUAEMCPServer: ObservableObject {
         guestCommandByMachine[machineID] = nil
         try? FileManager.default.removeItem(at: outputURL)
         try? FileManager.default.removeItem(at: statusURL)
+        let exitCodeKnown = status.count >= 6 && status[1] == 0x31
         var result: [String: Any] = ["machine_id": machineID, "request_id": request,
-                                     "status": "completed", "succeeded": byte == 0x31]
+                                     "status": "completed", "succeeded": byte == 0x31,
+                                     "exit_code_known": exitCodeKnown]
+        if exitCodeKnown {
+            let raw = status[2...5].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+            result["exit_code"] = Int(Int32(bitPattern: raw))
+        }
         if guestRequest.operation == .command {
             result["output"] = String(data: output, encoding: .isoLatin1) ?? ""
             result["output_base64"] = output.base64EncodedString()
@@ -1043,6 +1489,48 @@ public final class MacFSUAEMCPServer: ObservableObject {
         }
         if guestRequest.operation != .command { try? FileManager.default.removeItem(at: transferURL) }
         return try jsonText(result)
+    }
+
+    private func debuggerExecute(_ arguments: [String: Any], snapshot: Bool) async throws -> String {
+        let machineID = try requiredString("machine_id", in: arguments)
+        guard workerProcesses[machineID]?.isRunning == true,
+              workerExchangePaths[machineID] != nil else {
+            throw MCPFailure("No running machine \(machineID)")
+        }
+        guard debuggerMachines.insert(machineID).inserted else {
+            throw MCPFailure("Machine \(machineID) already has a debugger command running")
+        }
+        defer { debuggerMachines.remove(machineID) }
+        let commands: [String]
+        if snapshot {
+            commands = ["r", "H 32", "T"]
+        } else {
+            let command = try requiredString("command", in: arguments)
+            guard let data = command.data(using: .isoLatin1), !data.contains(0),
+                  data.count < 100 else {
+                throw MCPFailure("Debugger command must be Latin-1 text under 100 bytes")
+            }
+            commands = [command]
+        }
+        let request = UUID().uuidString.lowercased()
+        let resultURL = try exchangeURL(machineID: machineID,
+                                        name: "FSUAE-Debug-\(request)")
+        defer { try? FileManager.default.removeItem(at: resultURL) }
+        guard sendWorkerCommand(machineID, ["command": "debug", "request_id": request,
+                                             "commands": commands]) else {
+            throw MCPFailure("Could not send debugger command to machine \(machineID)")
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(6))
+        repeat {
+            if let data = try? Data(contentsOf: resultURL),
+               let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                return try jsonText(["machine_id": machineID, "commands": commands,
+                                     "succeeded": result["succeeded"] as? Bool ?? false,
+                                     "output": result["output"] as? String ?? ""])
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        } while ContinuousClock.now < deadline
+        throw MCPFailure("Debugger command timed out on machine \(machineID)")
     }
 
     private func exchangeName(in arguments: [String: Any]) throws -> String {

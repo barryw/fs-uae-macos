@@ -81,10 +81,20 @@ void sleep_millis (int ms) {
     //uae_msleep(ms);
 }
 
+static char *console_buffer;
+static int console_buffer_size;
+
 void console_out_f(const TCHAR *fmt, ...) {
     va_list arg_ptr;
     va_start(arg_ptr, fmt);
-    vprintf(fmt, arg_ptr);
+    if (console_buffer) {
+        const int used = strlen(console_buffer);
+        if (used < console_buffer_size - 1) {
+            vsnprintf(console_buffer + used, console_buffer_size - used, fmt, arg_ptr);
+        }
+    } else {
+        vprintf(fmt, arg_ptr);
+    }
     va_end(arg_ptr);
 }
 
@@ -101,7 +111,14 @@ void f_out(void *f, const TCHAR *format, ...)
 }
 
 void console_out (const TCHAR *msg) {
-    printf("%s", msg);
+    if (console_buffer) {
+        const int used = strlen(console_buffer);
+        if (used < console_buffer_size - 1) {
+            snprintf(console_buffer + used, console_buffer_size - used, "%s", msg);
+        }
+    } else {
+        printf("%s", msg);
+    }
 }
 
 int console_get_gui (TCHAR *out, int maxlen) {
@@ -182,9 +199,6 @@ int target_get_volume_name (struct uaedev_mount_info *mtinf,
     STUB("");
     return 0;
 }
-
-static char *console_buffer;
-static int console_buffer_size;
 
 char *setconsolemode (char *buffer, int maxlen) {
     char *ret = NULL;
