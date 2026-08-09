@@ -4,6 +4,8 @@
 /build/env/_temp/
 
 *~
+.build/
+/od-fs/
 *.a
 /aclocal.m4
 /*.adf

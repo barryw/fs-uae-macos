@@ -25,6 +25,8 @@
 #include "sysconfig.h"
 #include "sysdeps.h"
 
+#include <atomic>
+
 #include "threaddep/thread.h"
 #include "options.h"
 #include "uae.h"
@@ -62,6 +64,7 @@
 #include "scsi.h"
 #include "uaenative.h"
 #include "tabletlibrary.h"
+#include "execio.h"
 #include "cia.h"
 #include "picasso96.h"
 #include "cpuboard.h"
@@ -77,6 +80,162 @@
 
 #define TRACING_ENABLED 1
 int log_filesys = 0;
+static std::atomic<bool> fsuae_guest_control_ready{false};
+static std::atomic<bool> fsuae_guest_control_started{false};
+static std::atomic<uae_u32> fsuae_guest_control_heartbeats{0};
+
+enum {
+	FSUAEDEV_QUERY = 0x8001,
+	FSUAEDEV_PING = 0x8002,
+	FSUAEDEV_READ_LOG = 0x8003,
+	FSUAEDEV_CLEAR_LOG = 0x8004,
+	FSUAEDEV_STATUS_SIZE = 40
+};
+
+static uaecptr ROM_fsuaedev_resname, ROM_fsuaedev_resid, ROM_fsuaedev_init;
+static uae_u32 fsuaedev_opens, fsuaedev_requests, fsuaedev_last_command;
+static uae_s32 fsuaedev_last_error;
+static char fsuaedev_log[4096];
+static size_t fsuaedev_log_size;
+
+static bool fsuaedev_enabled(void)
+{
+	return getenv("FSUAE_MAC_EXCHANGE_DIRECTORY") != NULL;
+}
+
+static void fsuaedev_log_event(const char *text)
+{
+	size_t length = strlen(text);
+	if (length + 1 >= sizeof fsuaedev_log) {
+		text += length + 1 - sizeof fsuaedev_log;
+		length = sizeof fsuaedev_log - 1;
+	}
+	if (fsuaedev_log_size + length + 1 > sizeof fsuaedev_log) {
+		size_t discard = fsuaedev_log_size + length + 1 - sizeof fsuaedev_log;
+		memmove(fsuaedev_log, fsuaedev_log + discard, fsuaedev_log_size - discard);
+		fsuaedev_log_size -= discard;
+	}
+	memcpy(fsuaedev_log + fsuaedev_log_size, text, length);
+	fsuaedev_log_size += length;
+	fsuaedev_log[fsuaedev_log_size++] = '\n';
+}
+
+static uae_u32 REGPARAM2 fsuaedev_init(TrapContext *context)
+{
+	fsuaedev_log_event("device initialized");
+	return m68k_dreg(regs, 0);
+}
+
+static uae_u32 fsuaedev_open_fail(uaecptr request, int error)
+{
+	put_long(request + 20, -1);
+	put_byte(request + 31, error);
+	return (uae_u32)-1;
+}
+
+static uae_u32 REGPARAM2 fsuaedev_open(TrapContext *context)
+{
+	uaecptr request = m68k_areg(regs, 1);
+	if (m68k_dreg(regs, 0) != 0)
+		return fsuaedev_open_fail(request, IOERR_OPENFAIL);
+	if (get_word(request + 0x12) < IOSTDREQ_SIZE)
+		return fsuaedev_open_fail(request, IOERR_BADLENGTH);
+	put_long(request + 24, 1);
+	put_byte(request + 31, 0);
+	put_byte(request + 8, 7);
+	put_word(m68k_areg(regs, 6) + 32, get_word(m68k_areg(regs, 6) + 32) + 1);
+	fsuaedev_opens++;
+	fsuaedev_log_event("device opened");
+	return 0;
+}
+
+static uae_u32 REGPARAM2 fsuaedev_close(TrapContext *context)
+{
+	uaecptr request = m68k_areg(regs, 1);
+	put_long(request + 24, 0);
+	if (get_word(m68k_areg(regs, 6) + 32))
+		put_word(m68k_areg(regs, 6) + 32, get_word(m68k_areg(regs, 6) + 32) - 1);
+	fsuaedev_log_event("device closed");
+	return 0;
+}
+
+static uae_u32 REGPARAM2 fsuaedev_expunge(TrapContext *context)
+{
+	return 0;
+}
+
+static uae_u32 REGPARAM2 fsuaedev_beginio(TrapContext *context)
+{
+	uaecptr request = m68k_areg(regs, 1);
+	uae_u32 data = get_long(request + 40);
+	uae_u32 length = get_long(request + 36);
+	uae_u16 command = get_word(request + 28);
+	uae_s8 error = 0;
+	uae_u32 actual = 0;
+
+	put_byte(request + 8, 7);
+	fsuaedev_requests++;
+	fsuaedev_last_command = command;
+	switch (command) {
+	case CMD_RESET:
+		break;
+	case FSUAEDEV_QUERY:
+		if (length < FSUAEDEV_STATUS_SIZE || !valid_address(data, FSUAEDEV_STATUS_SIZE)) {
+			error = IOERR_BADLENGTH;
+			break;
+		}
+		put_long(data + 0, 0x46535545); /* FSUE */
+		put_word(data + 4, 1);
+		put_word(data + 6, 0);
+		put_long(data + 8, (fsuaedev_enabled() ? 1 : 0) |
+			(fsuae_guest_control_ready.load() ? 2 : 0));
+		put_long(data + 12, kickstart_version);
+		put_long(data + 16, fsuaedev_opens);
+		put_long(data + 20, fsuaedev_requests);
+		put_long(data + 24, fsuaedev_last_command);
+		put_long(data + 28, (uae_u32)fsuaedev_last_error);
+		put_long(data + 32, fsuae_guest_control_heartbeats.load());
+		put_long(data + 36, (uae_u32)fsuaedev_log_size);
+		actual = FSUAEDEV_STATUS_SIZE;
+		break;
+	case FSUAEDEV_PING:
+		actual = get_long(request + 44);
+		break;
+	case FSUAEDEV_READ_LOG:
+		if (!valid_address(data, length)) {
+			error = IOERR_BADADDRESS;
+			break;
+		}
+		actual = (uae_u32)std::min<size_t>(length, fsuaedev_log_size);
+		for (uae_u32 i = 0; i < actual; i++)
+			put_byte(data + i, fsuaedev_log[i]);
+		break;
+	case FSUAEDEV_CLEAR_LOG:
+		fsuaedev_log_size = 0;
+		break;
+	default:
+		error = IOERR_NOCMD;
+		break;
+	}
+	fsuaedev_last_error = error;
+	put_long(request + 32, actual);
+	put_byte(request + 31, error);
+	if (!(get_byte(request + 30) & 1))
+		uae_ReplyMsg(request);
+	return error;
+}
+
+static uae_u32 REGPARAM2 fsuaedev_abortio(TrapContext *context)
+{
+	uaecptr request = m68k_areg(regs, 1);
+	put_byte(request + 31, IOERR_ABORTED);
+	return IOERR_ABORTED;
+}
+
+int filesys_guest_control_is_ready(void)
+{
+	return fsuae_guest_control_ready.load();
+}
 
 #if TRACING_ENABLED
 #if 0
@@ -4647,10 +4806,19 @@ static uae_u32 REGPARAM2 fsmisc_helper (TrapContext *context)
 	return filesys_media_change_reply (context, 0);
 	case 2:
 	return filesys_media_change_reply (context, 1);
-	case 3:
+	case 3: {
 		uae_u32 t = getlocaltime ();
 		uae_u32 secs = (uae_u32)t - (8 * 365 + 2) * 24 * 60 * 60;
 		return secs;
+	}
+	case 18:
+		return getenv("FSUAE_MAC_EXCHANGE_DIRECTORY") &&
+			!fsuae_guest_control_started.exchange(true) ? 1 : 0;
+	case 19:
+		if (!fsuae_guest_control_ready.exchange(true))
+			fsuaedev_log_event("guest control connected");
+		fsuae_guest_control_heartbeats++;
+		return 1;
 	}
 	return 0;
 }
@@ -6933,6 +7101,11 @@ void filesys_reset (void)
 {
 	if (isrestore ())
 		return;
+	fsuae_guest_control_ready = false;
+	fsuae_guest_control_started = false;
+	fsuae_guest_control_heartbeats = 0;
+	if (fsuaedev_enabled())
+		fsuaedev_log_event("guest reset");
 	load_injected_icons();
 	filesys_reset2 ();
 	initialize_mountinfo ();
@@ -7112,6 +7285,21 @@ static uae_u32 REGPARAM2 filesys_doio(TrapContext *context)
 	return 0;
 }
 
+static uaecptr fsuaedev_startup(uaecptr resaddr)
+{
+	if (!ROM_fsuaedev_init)
+		return resaddr;
+	put_word(resaddr + 0x0, 0x4AFC);
+	put_long(resaddr + 0x2, resaddr);
+	put_long(resaddr + 0x6, resaddr + 0x1A);
+	put_word(resaddr + 0xA, 0x8101); /* RTF_AUTOINIT | RTF_COLDSTART, v1 */
+	put_word(resaddr + 0xC, 0x0305); /* NT_DEVICE, priority 5 */
+	put_long(resaddr + 0xE, ROM_fsuaedev_resname);
+	put_long(resaddr + 0x12, ROM_fsuaedev_resid);
+	put_long(resaddr + 0x16, ROM_fsuaedev_init);
+	return resaddr + 0x1A;
+}
+
 static uae_u32 REGPARAM2 filesys_diagentry (TrapContext *context)
 {
 	UnitInfo *uip = mountinfo.ui;
@@ -7158,7 +7346,7 @@ static uae_u32 REGPARAM2 filesys_diagentry (TrapContext *context)
 	* only knows about the one at address DiagArea + 0x10, we scan for other
 	* Resident structures and call InitResident() for them at the end of the
 	* diag entry. */
-
+	resaddr = fsuaedev_startup(resaddr);
 #ifdef WITH_SEGTRACKER
 	resaddr = segtracker_startup(resaddr);
 #endif
@@ -8501,6 +8689,48 @@ void filesys_hsync() {
 #endif // UAE_FILESYS_THREADS
 #endif // FSUAE
 
+static void fsuaedev_install(void)
+{
+	uae_u32 functable, datatable;
+	uae_u32 initcode, openfunc, closefunc, expungefunc, beginiofunc, abortiofunc;
+
+	if (!fsuaedev_enabled())
+		return;
+	ROM_fsuaedev_resname = ds(_T("fsuae.device"));
+	ROM_fsuaedev_resid = ds(_T("FS-UAE Mac guest device 0.1"));
+	initcode = here();
+	calltrap(deftrap(fsuaedev_init)); dw(RTS);
+	openfunc = here();
+	calltrap(deftrap(fsuaedev_open)); dw(RTS);
+	closefunc = here();
+	calltrap(deftrap(fsuaedev_close)); dw(RTS);
+	expungefunc = here();
+	calltrap(deftrap(fsuaedev_expunge)); dw(RTS);
+	beginiofunc = here();
+	calltrap(deftrap(fsuaedev_beginio)); dw(RTS);
+	abortiofunc = here();
+	calltrap(deftrap(fsuaedev_abortio)); dw(RTS);
+
+	functable = here();
+	dl(openfunc); dl(closefunc); dl(expungefunc); dl(EXPANSION_nullfunc);
+	dl(beginiofunc); dl(abortiofunc); dl(0xFFFFFFFFul);
+
+	datatable = here();
+	dw(0xE000); dw(0x0008); dw(0x0300); /* LN_TYPE = NT_DEVICE */
+	dw(0xC000); dw(0x000A); dl(ROM_fsuaedev_resname);
+	dw(0xE000); dw(0x000E); dw(0x0600); /* LIBF_SUMUSED | LIBF_CHANGED */
+	dw(0xD000); dw(0x0014); dw(0x0001);
+	dw(0xD000); dw(0x0016); dw(0x0000);
+	dw(0xC000); dw(0x0018); dl(ROM_fsuaedev_resid);
+	dw(0x0000);
+
+	ROM_fsuaedev_init = here();
+	dl(0x00000100);
+	dl(functable);
+	dl(datatable);
+	dl(initcode);
+}
+
 void filesys_install (void)
 {
 	uaecptr loop;
@@ -8509,6 +8739,7 @@ void filesys_install (void)
 
 	uae_sem_init (&singlethread_int_sem, 0, 1);
 	uae_sem_init (&test_sem, 0, 1);
+	fsuaedev_install();
 
 	ROM_filesys_resname = ds_ansi ("UAEunixfs.resource");
 	ROM_filesys_resid = ds_ansi ("UAE unixfs 0.4");

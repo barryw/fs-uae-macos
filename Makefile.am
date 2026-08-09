@@ -156,6 +156,10 @@ fs_uae_SOURCES = \
 	src/fs-uae/uae_config.c \
 	src/fs-uae/video.c
 
+if MACOS
+fs_uae_SOURCES += src/od-fs/macos/fsuaemac.cpp
+endif
+
 
 if WINDOWS
 nodist_fs_uae_SOURCES += src/fs-uae/fs-uae.rc
@@ -1155,6 +1159,13 @@ CM_CFLAGS += @LIBMPEG2_CFLAGS@
 LIBS += @LIBMPEG2_LIBS@
 endif
 
+if MACOS
+libfsuaemac.dylib: $(BUILT_SOURCES) $(fs_uae_OBJECTS) $(fs_uae_DEPENDENCIES)
+	$(CXX) $(AM_CXXFLAGS) $(CXXFLAGS) $(AM_LDFLAGS) $(LDFLAGS) \
+		-dynamiclib -Wl,-install_name,@rpath/libfsuaemac.dylib \
+		-o $@ $(fs_uae_OBJECTS) $(fs_uae_LDADD) $(LIBS)
+endif
+
 gen_build68k_SOURCES = \
 	src/build68k.cpp \
 	src/writelog.cpp
@@ -1276,6 +1287,10 @@ EXTRA_DIST = $(TESTS) $(EXTRA_TESTS) \
 	share/mime
 
 CLEANFILES = $(BUILT_SOURCES)
+
+if MACOS
+CLEANFILES += libfsuaemac.dylib
+endif
 
 if CODEGEN
 

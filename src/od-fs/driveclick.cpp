@@ -31,38 +31,39 @@ void amiga_set_drive_sound_name(const char *name)
 
 int driveclick_loadresource (struct drvsample *sp, int drivetype)
 {
+    static const char *files[DS_END] = {
+        "drive_click.wav",
+        "drive_spin.wav",
+        "drive_spinnd.wav",
+        "drive_startup.wav",
+        "drive_snatch.wav",
+    };
+    int loaded = 0;
+
     for (int type = 0; type < DS_END; type++) {
-        const char *name = NULL;
-        switch (type) {
-        case 0:
-            name = "share/fs-uae/floppy_sounds/drive_click.wav";
-            break;
-        case 1:
-            name = "share/fs-uae/floppy_sounds/drive_spin.wav";
-            break;
-        case 2:
-            name = "share/fs-uae/floppy_sounds/drive_spinnd.wav";
-            break;
-        case 3:
-            name = "share/fs-uae/floppy_sounds/drive_startup.wav";
-            break;
-        case 4:
-            name = "share/fs-uae/floppy_sounds/drive_snatch.wav";
-            break;
-        default:
-            continue;
-        }
         char *data = NULL;
         int size = 0;
-        if (fs_data_file_content(name, &data, &size) == 0) {
+        char *path = g_build_filename(g_driveclick_path, files[type], NULL);
+        gsize file_size = 0;
+        if (!g_file_get_contents(path, &data, &file_size, NULL)) {
+            char *name = g_build_filename("share", "fs-uae", "floppy_sounds",
+                                          files[type], NULL);
+            fs_data_file_content(name, &data, &size);
+            g_free(name);
+        } else {
+            size = (int) file_size;
+        }
+        g_free(path);
+        if (data) {
             int len = (int) size;
             struct drvsample* s = sp + type;
             s->p = decodewav((uae_u8*) data, &len);
             s->len = len;
-            free(data);
+            loaded += s->p != NULL;
+            g_free(data);
         }
     }
-    return 1;
+    return loaded != 0;
 }
 
 void driveclick_fdrawcmd_close(int drive)

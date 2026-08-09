@@ -17,6 +17,8 @@
 
 struct hardfilehandle;
 
+int filesys_guest_control_is_ready(void);
+
 #define MAX_HDF_CACHE_BLOCKS 128
 #define MAX_SCSI_SENSE 36
 struct hdf_cache

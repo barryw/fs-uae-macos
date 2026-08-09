@@ -218,6 +218,21 @@ static void configure_hard_drive_directory(
     g_free(type);
 }
 
+void fs_uae_configure_host_directory(const char *path, const char *device,
+                                     const char *label, int boot_priority)
+{
+    char *filesystem = g_strdup_printf("rw,%s:%s:%s,%d", device, label, path,
+                                       boot_priority);
+    amiga_set_option("filesystem2", filesystem);
+    int hfi = next_uaehfi();
+    char *key = g_strdup_printf("uaehf%d", hfi);
+    char *value = g_strdup_printf("dir,%s", filesystem);
+    amiga_set_option(key, value);
+    g_free(value);
+    g_free(key);
+    g_free(filesystem);
+}
+
 static void configure_hard_drive_image(
     int index, const char *path, const char *device, int read_only,
     int boot_priority)

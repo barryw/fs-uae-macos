@@ -152,6 +152,7 @@ myafterdos
 	jsr -$01a4(a6) ;SetFunction (restore original)
 	bsr.w clipboard_init
 	bsr.w consolehook
+	bsr.w control_init
 	movem.l (sp)+,d0-d7/a1-a6
 	rts ;return directly to caller
 
@@ -770,7 +771,7 @@ addvolumenode
 	tst.b 32+44(a3)
 	beq.s .end ;empty volume string = empty drive
 	move.l 160(a3),a6
-	cmp.w #37, 20(a6)
+	cmp.w #37,20(a6)
 	bcs.s .prev37
 	moveq #(1<<1)+(1<<3)+(1<<2),d1 ;LDF_WRITE | LDF_VOLUMES | LDF_DEVICES
 	jsr -$29A(a6) ;AttemptLockDosList
@@ -1406,6 +1407,9 @@ filesys_mainloop_bcpl:
 
 	moveq #1,d0
 	bsr.w addvolumenode
+	; The filesystem handler is a DOS process on every supported Kickstart,
+	; including 1.2/1.3. The host trap ensures only one control process starts.
+	bsr.w control_init
 
 	btst #1,d2
 	beq.s .nonotif
@@ -1472,11 +1476,11 @@ FSML_loop:
 	beq.s nonnotif
 
 	; notify reply?
-	cmp.w #38, 18(a4)
+	cmp.w #38,18(a4)
 	bne.s nonnotif
-	cmp.l #NOTIFY_CLASS, 20(a4)
+	cmp.l #NOTIFY_CLASS,20(a4)
 	bne.s nonnotif
-	cmp.w #NOTIFY_CODE, 24(a4)
+	cmp.w #NOTIFY_CODE,24(a4)
 	bne.s nonnotif
 	move.l 26(a4),a0 ; NotifyRequest
 	move.l 12(a0),d0 ; flags
@@ -2118,7 +2122,7 @@ mhloop
 
 	move.w MH_X+MH_DATA(a5),12+2(a0) ;ient_TabletX
 	clr.w 16(a0)
-	move.w MH_Y++MH_DATA(a5),16+2(a0) ;ient_TabletY
+	move.w MH_Y+MH_DATA(a5),16+2(a0) ;ient_TabletY
 	clr.w 20(a0)
 	move.w MH_MAXX+MH_DATA(a5),20+2(a0) ;ient_RangeX
 	clr.w 24(a0)
@@ -2304,6 +2308,177 @@ mousehackint:
 .l3
 	lea $dff000,a0
 	moveq #0,d0
+	rts
+
+; FS-UAE Mac guest-control process. The host trap is deliberately tiny here;
+; commands and file operations are added behind the same polling contract.
+control_init:
+	movem.l d0-d1/a0-a1/a6,-(sp)
+	move.w #$FF58,d0
+	bsr.w getrtbase
+	moveq #18,d0
+	jsr (a0)
+	tst.l d0
+	beq.s .disabled
+	lea control_name(pc),a0
+	lea control_proc(pc),a1
+	moveq #-5,d0
+	move.l #8000,d1
+	bsr.w createproc
+.disabled
+	movem.l (sp)+,d0-d1/a0-a1/a6
+	rts
+
+	dc.l 16
+control_proc:
+	dc.l 0
+	move.l 4.w,a6
+	move.l a6,a2
+	move.l #4096,d0
+	move.l #$10001,d1
+	jsr AllocMem(a6)
+	tst.l d0
+	beq.w .done
+	move.l d0,a3
+	lea doslibname(pc),a1
+	moveq #0,d0
+	jsr -$0228(a6) ; OpenLibrary
+	tst.l d0
+	beq.w .free
+	move.l d0,a5
+	move.w #$FF58,d0
+	bsr.w getrtbase
+	move.l a0,a4
+.poll
+	moveq #19,d0
+	jsr (a4)
+	move.l a5,a6
+	lea control_command(pc),a0
+	move.l a0,d1
+	move.l #1005,d2 ; MODE_OLDFILE
+	jsr -$001e(a6) ; Open
+	move.l d0,d4
+	beq.w .delay
+	move.l d4,d1
+	move.l a3,d2
+	move.l #4095,d3
+	jsr -$002a(a6) ; Read
+	move.l d0,d5
+	move.l d4,d1
+	jsr -$0024(a6) ; Close
+	lea control_command(pc),a0
+	move.l a0,d1
+	jsr -$0048(a6) ; DeleteFile
+	tst.l d5
+	ble.w .delay
+	clr.b 0(a3,d5.l)
+	cmp.b #'P',(a3)
+	beq.s .put
+	cmp.b #'G',(a3)
+	beq.s .get
+
+	lea control_output(pc),a0
+	move.l a0,d1
+	move.l #1006,d2 ; MODE_NEWFILE
+	jsr -$001e(a6) ; Open
+	move.l d0,d4
+	beq.w .delay
+	lea 1(a3),a0
+	move.l a0,d1
+	moveq #0,d2
+	move.l d4,d3
+	jsr -$00de(a6) ; Execute
+	move.l d0,d6
+	move.l d4,d1
+	jsr -$0024(a6) ; Close
+	bra.s .status
+
+.put
+	lea control_transfer(pc),a0
+	lea 1(a3),a1
+	bsr.s control_copy
+	move.l d0,d6
+	bra.s .status
+.get
+	lea 1(a3),a0
+	lea control_transfer(pc),a1
+	bsr.s control_copy
+	move.l d0,d6
+
+.status
+	lea control_status(pc),a0
+	move.l a0,d1
+	move.l #1006,d2 ; MODE_NEWFILE
+	jsr -$001e(a6) ; Open
+	move.l d0,d4
+	beq.w .delay
+	lea control_failed(pc),a0
+	tst.l d6
+	beq.s .write_status
+	lea control_succeeded(pc),a0
+.write_status
+	move.l d4,d1
+	move.l a0,d2
+	moveq #1,d3
+	jsr -$0030(a6) ; Write
+	move.l d4,d1
+	jsr -$0024(a6) ; Close
+.delay
+	move.l a5,a6
+	moveq #2,d1
+	jsr -$00c6(a6) ; Delay
+	bra.w .poll
+.free
+	move.l a3,a1
+	move.l #4096,d0
+	move.l a2,a6
+	jsr FreeMem(a6)
+.done
+	rts
+
+; Copy A0 to A1 with only the original DOS calls available on Kickstart 1.2.
+control_copy:
+	move.l a1,d6
+	move.l a0,d1
+	move.l #1005,d2 ; MODE_OLDFILE
+	jsr -$001e(a6) ; Open
+	move.l d0,d4
+	beq.s .failed
+	move.l d6,d1
+	move.l #1006,d2 ; MODE_NEWFILE
+	jsr -$001e(a6) ; Open
+	move.l d0,d7
+	beq.s .close_source
+.copy
+	move.l d4,d1
+	move.l a3,d2
+	move.l #4096,d3
+	jsr -$002a(a6) ; Read
+	tst.l d0
+	beq.s .succeeded
+	bmi.s .close_both
+	move.l d0,d5
+	move.l d7,d1
+	move.l a3,d2
+	move.l d5,d3
+	jsr -$0030(a6) ; Write
+	cmp.l d5,d0
+	beq.s .copy
+.close_both
+	move.l d7,d1
+	jsr -$0024(a6) ; Close
+.close_source
+	move.l d4,d1
+	jsr -$0024(a6) ; Close
+.failed
+	moveq #0,d0
+	rts
+.succeeded
+	move.l d7,d1
+	jsr -$0024(a6) ; Close
+	move.l d4,d1
+	jsr -$0024(a6) ; Close
+	moveq #1,d0
 	rts
 
 ; clipboard sharing
@@ -2941,6 +3116,13 @@ clip_dev: dc.b 'clipboard.device',0
  ;argghh but StartNotify()ing non-existing ENV: causes "Insert disk ENV: in any drive" dialog..
 pointer_prefs: dc.b 'RAM:Env/Sys/Pointer.prefs',0
 clname: dc.b 'UAE clipboard sharing',0
+control_name: dc.b 'FS-UAE Mac control',0
+control_command: dc.b 'MCP:FSUAE-Control-Command',0
+control_output: dc.b 'MCP:FSUAE-Control-Output',0
+control_status: dc.b 'MCP:FSUAE-Control-Status',0
+control_transfer: dc.b 'MCP:FSUAE-Control-Transfer',0
+control_succeeded: dc.b '1'
+control_failed: dc.b '0'
 mhname: dc.b 'UAE mouse driver',0
 kaname: dc.b 'UAE heart beat',0
 exter_name: dc.b 'UAE filesystem',0

@@ -107,8 +107,10 @@ void fs_uae_configure_graphics_card(amiga_config *c)
         fs_emu_warning("Unsupported graphics card: %s\n", card);
     }
 
-    if (fs_config_get_const_string(OPTION_GRAPHICS_CARD_MEMORY)) {
-        memory = fs_uae_read_memory_option(OPTION_GRAPHICS_CARD_MEMORY);
+    const char *memory_option = fs_config_get_const_string(OPTION_GRAPHICS_CARD_MEMORY)
+            ? OPTION_GRAPHICS_CARD_MEMORY : OPTION_GRAPHICS_MEMORY;
+    if (fs_config_get_const_string(memory_option)) {
+        memory = fs_uae_read_memory_option(memory_option);
         memory /= 1024;
         fs_log("CONFIG: Overriding graphics card memory: %d MB\n", memory);
     }
