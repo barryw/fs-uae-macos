@@ -2346,6 +2346,19 @@ control_proc:
 	tst.l d0
 	beq.w .free
 	move.l d0,a5
+	lea control_current_dir(pc),a0
+	move.l a0,d1
+	moveq #-2,d2 ; ACCESS_READ
+	jsr -$0054(a5) ; Lock
+	tst.l d0
+	beq.w .free
+	move.l d0,d3
+	lsl.l #2,d0 ; BADDR(lock)
+	move.l d0,a0
+	move.l 12(a0),d1 ; FileLock.fl_Task
+	jsr -$0210(a5) ; SetFileSysTask
+	move.l d3,d1
+	jsr -$007e(a5) ; CurrentDir
 	move.w #$FF58,d0
 	bsr.w getrtbase
 	move.l a0,a4
@@ -2373,9 +2386,9 @@ control_proc:
 	ble.w .delay
 	clr.b 0(a3,d5.l)
 	cmp.b #'P',(a3)
-	beq.s .put
+	beq.w .put
 	cmp.b #'G',(a3)
-	beq.s .get
+	beq.w .get
 
 	lea control_output(pc),a0
 	move.l a0,d1
@@ -2385,17 +2398,35 @@ control_proc:
 	beq.w .delay
 	cmp.w #36,20(a5) ; SystemTagList requires dos.library V36
 	blo.s .execute_old
+	lea control_console(pc),a0
+	move.l a0,d1
+	move.l #1005,d2 ; MODE_OLDFILE
+	jsr -$001e(a6) ; Open
+	move.l d0,d3
+	beq.s .launch_failed
 	clr.l -(sp) ; TAG_DONE data
 	clr.l -(sp) ; TAG_DONE
+	move.l #65536,-(sp) ; enough stack for GUI applications and requesters
+	move.l #$800003F3,-(sp) ; NP_StackSize
+	clr.l -(sp) ; NP_WindowPtr data: allow requesters on the default public screen
+	move.l #$800003F7,-(sp) ; NP_WindowPtr
 	move.l d4,-(sp) ; output handle
 	move.l #$80000022,-(sp) ; SYS_Output
+	move.l d3,-(sp) ; input handle gives the child a valid console task
+	move.l #$80000021,-(sp) ; SYS_Input
 	lea 1(a3),a0
 	move.l a0,d1
 	move.l sp,d2
 	jsr -$025e(a6) ; SystemTagList
-	lea 16(sp),sp
+	lea 40(sp),sp
 	move.l d0,d6 ; real command return code
+	move.l d3,d1
+	jsr -$0024(a6) ; Close
 	moveq #1,d7 ; exit code is known
+	bra.s .close_output
+.launch_failed
+	moveq #20,d6
+	moveq #1,d7
 	bra.s .close_output
 .execute_old
 	lea 1(a3),a0
@@ -2478,6 +2509,12 @@ control_copy:
 	jsr -$001e(a6) ; Open
 	move.l d0,d4
 	beq.s .failed
+	; Some handlers leave an existing file unchanged when MODE_NEWFILE opens it.
+	; file_put is an explicit replacement operation, so remove the old target
+	; before creating the destination. DeleteFile failure is harmless here: the
+	; following Open remains the authoritative success check.
+	move.l d6,d1
+	jsr -$0048(a6) ; DeleteFile
 	move.l d6,d1
 	move.l #1006,d2 ; MODE_NEWFILE
 	jsr -$001e(a6) ; Open
@@ -3151,6 +3188,8 @@ clip_dev: dc.b 'clipboard.device',0
 pointer_prefs: dc.b 'RAM:Env/Sys/Pointer.prefs',0
 clname: dc.b 'UAE clipboard sharing',0
 control_name: dc.b 'FS-UAE Mac control',0
+control_current_dir: dc.b 'MCP:',0
+control_console: dc.b 'CON:0/0/1/1/MCP/AUTO/CLOSE/WAIT',0
 control_command: dc.b 'MCP:FSUAE-Control-Command',0
 control_output: dc.b 'MCP:FSUAE-Control-Output',0
 control_status: dc.b 'MCP:FSUAE-Control-Status',0

@@ -103,6 +103,7 @@ int main(int argc, char **argv)
         LOAD(fsuaemac_stop);
         LOAD(fsuaemac_queue_key);
         LOAD(fsuaemac_queue_mouse_move);
+        LOAD(fsuaemac_queue_mouse_position);
         LOAD(fsuaemac_queue_mouse_button);
         LOAD(fsuaemac_queue_pause);
         LOAD(fsuaemac_set_speed);
@@ -124,6 +125,7 @@ int main(int argc, char **argv)
             keys_ok &= fsuaemac_queue_key_fn(keys[i], 0);
         }
         fsuaemac_queue_mouse_move_fn(4, -3);
+        fsuaemac_queue_mouse_position_fn(8, 6);
         fsuaemac_queue_mouse_button_fn(0, 1);
         fsuaemac_queue_mouse_button_fn(0, 0);
 

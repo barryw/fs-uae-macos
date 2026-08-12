@@ -212,6 +212,11 @@ public final class MacFSUAEMCPServer: ObservableObject {
     private var workerFramePaths: [String: String] = [:]
     private var workerExchangePaths: [String: String] = [:]
     private enum GuestOperation { case command, put, get }
+    private struct HDFOverride {
+        let drive: Int
+        let path: String
+        let readOnly: Bool
+    }
     private struct GuestRequest {
         let machineID: String
         let operation: GuestOperation
@@ -488,13 +493,37 @@ public final class MacFSUAEMCPServer: ObservableObject {
              "required": required, "additionalProperties": false]
         }
         return [
-            tool("fsuae_machine_start", "Start a machine using an exact saved configuration name. Optionally replace its startup floppy set; an empty array boots with all floppies ejected.", [
+            tool("fsuae_machine_start", "Start a machine using an exact saved configuration name. Optionally replace its startup floppy set or attach disposable HDFs without changing the saved configuration.", [
                 "type": "object",
                 "properties": [
                     "configuration": ["type": "string", "description": "Saved configuration name"],
                     "floppies": ["type": "array", "maxItems": 4,
                                   "items": ["type": "string"],
                                   "description": "Exact DF0-DF3 startup paths; omitted drives are ejected"],
+                    "hdf": [
+                        "type": "object",
+                        "properties": [
+                            "path": ["type": "string", "description": "Absolute host path to an existing block-aligned HDF"],
+                            "drive": ["type": "integer", "minimum": 0, "maximum": 9,
+                                      "description": "Unused DH0-DH9 slot; defaults to the first unused slot"],
+                            "read_only": ["type": "boolean", "default": false],
+                        ],
+                        "required": ["path"], "additionalProperties": false,
+                    ],
+                    "hdfs": [
+                        "type": "array", "maxItems": 10,
+                        "items": [
+                            "type": "object",
+                            "properties": [
+                                "path": ["type": "string", "description": "Absolute host path to an existing block-aligned HDF"],
+                                "drive": ["type": "integer", "minimum": 0, "maximum": 9,
+                                          "description": "Unused DH0-DH9 slot; defaults to the first unused slot"],
+                                "read_only": ["type": "boolean", "default": false],
+                            ],
+                            "required": ["path"], "additionalProperties": false,
+                        ],
+                        "description": "Disposable HDF attachments; mutually exclusive with hdf",
+                    ],
                 ],
                 "required": ["configuration"], "additionalProperties": false,
             ]),
@@ -538,6 +567,25 @@ public final class MacFSUAEMCPServer: ObservableObject {
             tool("fsuae_screen_capture", "Capture the latest visible Amiga frame as a cropped PNG image. Works for headed and headless machines.",
                  stringSchema(["machine_id": "Running machine UUID"],
                               required: ["machine_id"])),
+            tool("fsuae_input", "Queue one keyboard or relative mouse event on a running machine.", [
+                "type": "object",
+                "properties": [
+                    "machine_id": ["type": "string", "description": "Running machine UUID"],
+                    "event": ["type": "string", "enum": ["key", "mouse_move", "mouse_button", "mouse_click"]],
+                    "code": ["type": "integer", "minimum": 0, "maximum": 65535,
+                             "description": "macOS virtual key code for a key event"],
+                    "pressed": ["type": "boolean", "description": "Key or mouse-button state"],
+                    "delta_x": ["type": "integer", "minimum": -32768, "maximum": 32767],
+                    "delta_y": ["type": "integer", "minimum": -32768, "maximum": 32767],
+                    "x": ["type": "integer", "minimum": 0, "maximum": 32767,
+                          "description": "Absolute guest-screen x for mouse_click"],
+                    "y": ["type": "integer", "minimum": 0, "maximum": 32767,
+                          "description": "Absolute guest-screen y for mouse_click"],
+                    "button": ["type": "integer", "minimum": 0, "maximum": 2,
+                               "description": "Mouse button: 0 left, 1 middle, 2 right"],
+                ],
+                "required": ["machine_id", "event"], "additionalProperties": false,
+            ]),
             tool("fsuae_configurations_list", "List saved FS-UAE configurations and models.", empty),
             tool("fsuae_exchange_put", "Place a base64-encoded file on a machine's drive-independent MCP: volume.",
                  stringSchema(["machine_id": "Running machine UUID",
@@ -613,10 +661,14 @@ public final class MacFSUAEMCPServer: ObservableObject {
                 throw MCPFailure("No configuration named \(requested)")
             }
             let floppies = try floppyPaths(in: arguments)
+            let hdfs = try hdfOverrides(in: arguments, configuration: configuration)
             let machine = try startWorker(configuration,
                                           presentation: isHeadless ? "headless" : "headed",
-                                          floppies: floppies)
-            return "Started \(configuration.name) (\(configuration.model)); machine_id \(machine.id); pid \(machine.processIdentifier)"
+                                          floppies: floppies, hdfs: hdfs)
+            let attachment = hdfs.map {
+                "; hdf DH\($0.drive)=\($0.path) (\($0.readOnly ? "read-only" : "read-write"))"
+            }.joined()
+            return "Started \(configuration.name) (\(configuration.model)); machine_id \(machine.id); pid \(machine.processIdentifier)\(attachment)"
         case "fsuae_machine_stop":
             return try stopMachine(arguments)
         case "fsuae_machines_list":
@@ -629,6 +681,8 @@ public final class MacFSUAEMCPServer: ObservableObject {
             return try resetMachine(arguments)
         case "fsuae_machine_diagnostics":
             return try await machineDiagnostics(arguments)
+        case "fsuae_input":
+            return try await queueInput(arguments)
         case "fsuae_configurations_list":
             let rows = library.configurations.map { configuration in
                 let sessions = runningMachines.filter {
@@ -689,7 +743,8 @@ public final class MacFSUAEMCPServer: ObservableObject {
 
     private func startWorker(_ configuration: FSUAEConfiguration,
                              presentation: String,
-                             floppies: [String]? = nil) throws -> MacFSUAERunningMachine {
+                             floppies: [String]? = nil,
+                             hdfs: [HDFOverride] = []) throws -> MacFSUAERunningMachine {
         guard let executable = workerExecutable else {
             throw MCPFailure("FS-UAE Worker is missing")
         }
@@ -727,11 +782,19 @@ public final class MacFSUAEMCPServer: ObservableObject {
             throw MCPFailure("Could not create the display channel")
         }
         environment["FSUAE_MAC_FRAME_FILE"] = framePath
+        if presentation == "headless" {
+            environment["FSUAE_MAC_ABSOLUTE_MOUSE"] = "1"
+        }
         if let floppies {
             for drive in 0..<4 {
                 environment["FSUAE_MAC_FLOPPY_\(drive)"] = drive < floppies.count
                     ? floppies[drive] : ""
             }
+        }
+        for hdf in hdfs {
+            environment["FSUAE_MAC_HARD_DRIVE_\(hdf.drive)"] = hdf.path
+            environment["FSUAE_MAC_HARD_DRIVE_\(hdf.drive)_READ_ONLY"] =
+                hdf.readOnly ? "1" : "0"
         }
         if environment["FSUAE_MAC_RUNTIME"] == nil,
            let runtime = Bundle.main.privateFrameworksURL?
@@ -1136,6 +1199,75 @@ public final class MacFSUAEMCPServer: ObservableObject {
         return try jsonText(result)
     }
 
+    private func queueInput(_ arguments: [String: Any]) async throws -> String {
+        let machineID = try requiredString("machine_id", in: arguments)
+        guard workerProcesses[machineID]?.isRunning == true else {
+            throw MCPFailure("No running machine \(machineID)")
+        }
+        let event = try requiredString("event", in: arguments)
+        let command: [String: Any]
+        switch event {
+        case "key":
+            guard let code = arguments["code"] as? Int, (0...65535).contains(code),
+                  let pressed = arguments["pressed"] as? Bool else {
+                throw MCPFailure("key requires code 0...65535 and pressed")
+            }
+            command = ["command": "key", "code": code, "pressed": pressed]
+        case "mouse_move":
+            guard let deltaX = arguments["delta_x"] as? Int, (-32768...32767).contains(deltaX),
+                  let deltaY = arguments["delta_y"] as? Int, (-32768...32767).contains(deltaY) else {
+                throw MCPFailure("mouse_move requires delta_x and delta_y in -32768...32767")
+            }
+            command = ["command": "mouse_move", "x": deltaX, "y": deltaY]
+        case "mouse_button":
+            guard let button = arguments["button"] as? Int, (0...2).contains(button),
+                  let pressed = arguments["pressed"] as? Bool else {
+                throw MCPFailure("mouse_button requires button 0...2 and pressed")
+            }
+            command = ["command": "mouse_button", "button": button, "pressed": pressed]
+        case "mouse_click":
+            guard let x = arguments["x"] as? Int, (0...32767).contains(x),
+                  let y = arguments["y"] as? Int, (0...32767).contains(y),
+                  let button = arguments["button"] as? Int, (0...2).contains(button) else {
+                throw MCPFailure("mouse_click requires x, y in 0...32767 and button 0...2")
+            }
+            var frame: MacFSUAEFrame?
+            for _ in 0..<40 {
+                frame = workerFrameSources[machineID]?.latest(after: 0)
+                if frame != nil { break }
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            guard let frame else {
+                throw MCPFailure("No video frame became available for machine \(machineID)")
+            }
+            let bounds = CGRect(x: 0, y: 0, width: frame.width, height: frame.height)
+            let crop = (frame.crop.isEmpty ? bounds : frame.crop).integral.intersection(bounds)
+            guard x < Int(crop.width), y < Int(crop.height) else {
+                throw MCPFailure("mouse_click coordinates are outside the captured frame")
+            }
+            guard sendWorkerCommand(machineID, ["command": "mouse_position",
+                                                 "x": x + Int(crop.minX),
+                                                 "y": y + Int(crop.minY)]) else {
+                throw MCPFailure("Could not position the mouse on machine \(machineID)")
+            }
+            try await Task.sleep(for: .milliseconds(50))
+            guard sendWorkerCommand(machineID, ["command": "mouse_button", "button": button, "pressed": true]) else {
+                throw MCPFailure("Could not press the mouse button on machine \(machineID)")
+            }
+            try await Task.sleep(for: .milliseconds(75))
+            guard sendWorkerCommand(machineID, ["command": "mouse_button", "button": button, "pressed": false]) else {
+                throw MCPFailure("Could not release the mouse button on machine \(machineID)")
+            }
+            return "Queued mouse_click on machine \(machineID)"
+        default:
+            throw MCPFailure("event must be key, mouse_move, mouse_button, or mouse_click")
+        }
+        guard sendWorkerCommand(machineID, command) else {
+            throw MCPFailure("Could not queue input on machine \(machineID)")
+        }
+        return "Queued \(event) on machine \(machineID)"
+    }
+
     private func waitForMachine(_ arguments: [String: Any]) async throws -> String {
         let machineID = try requiredString("machine_id", in: arguments)
         guard try requiredString("condition", in: arguments) == "workbench" else {
@@ -1252,6 +1384,55 @@ public final class MacFSUAEMCPServer: ObservableObject {
             throw MCPFailure("floppies must contain at most four paths")
         }
         return try paths.map(validatedFloppyPath)
+    }
+
+    private func hdfOverrides(in arguments: [String: Any],
+                              configuration: FSUAEConfiguration) throws -> [HDFOverride] {
+        guard arguments["hdf"] == nil || arguments["hdfs"] == nil else {
+            throw MCPFailure("hdf and hdfs are mutually exclusive")
+        }
+        let values: [[String: Any]]
+        if let value = arguments["hdf"] {
+            guard let hdf = value as? [String: Any] else { throw MCPFailure("hdf must be an object") }
+            values = [hdf]
+        } else if let value = arguments["hdfs"] {
+            guard let hdfs = value as? [[String: Any]], hdfs.count <= 10 else {
+                throw MCPFailure("hdfs must contain at most ten attachments")
+            }
+            values = hdfs
+        } else {
+            return []
+        }
+
+        var used = Set<Int>()
+        return try values.map { hdf in
+            guard let path = hdf["path"] as? String, !path.contains("\0"), path.hasPrefix("/") else {
+                throw MCPFailure("hdf.path must be an absolute host path")
+            }
+            let drive = hdf["drive"] as? Int ?? (0..<10).first {
+                configuration.value(for: "hard_drive_\($0)")?.isEmpty != false && !used.contains($0)
+            }
+            guard let drive, (0..<10).contains(drive), !used.contains(drive) else {
+                throw MCPFailure("hdf.drive must identify an unused DH0-DH9 slot")
+            }
+            guard configuration.value(for: "hard_drive_\(drive)")?.isEmpty != false else {
+                throw MCPFailure("DH\(drive) is already used by \(configuration.name)")
+            }
+            let url = URL(fileURLWithPath: path).standardizedFileURL
+            let metadata = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey,
+                                                             .fileSizeKey])
+            guard metadata.isRegularFile == true, metadata.isSymbolicLink != true,
+                  let size = metadata.fileSize, size >= 512, size.isMultiple(of: 512),
+                  FileManager.default.isReadableFile(atPath: url.path) else {
+                throw MCPFailure("hdf.path must be a readable, non-symlinked file whose size is a multiple of 512 bytes")
+            }
+            let readOnly = hdf["read_only"] as? Bool ?? false
+            guard readOnly || FileManager.default.isWritableFile(atPath: url.path) else {
+                throw MCPFailure("hdf.path is not writable; set read_only to true")
+            }
+            used.insert(drive)
+            return HDFOverride(drive: drive, path: url.path, readOnly: readOnly)
+        }
     }
 
     private func validatedFloppyPath(_ path: String) throws -> String {

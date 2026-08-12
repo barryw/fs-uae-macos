@@ -92,6 +92,7 @@ FSUAE_MAC_API void fsuaemac_stop(void);
 FSUAE_MAC_API int fsuaemac_queue_input(int32_t event, int32_t state);
 FSUAE_MAC_API int fsuaemac_queue_key(uint16_t mac_key_code, int32_t pressed);
 FSUAE_MAC_API int fsuaemac_queue_mouse_move(int32_t delta_x, int32_t delta_y);
+FSUAE_MAC_API int fsuaemac_queue_mouse_position(int32_t x, int32_t y);
 FSUAE_MAC_API int fsuaemac_queue_mouse_button(uint32_t button, int32_t pressed);
 FSUAE_MAC_API int fsuaemac_debug_command(const char *command, char *output,
                                          uint32_t output_size, uint32_t timeout_ms);

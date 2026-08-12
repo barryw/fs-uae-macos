@@ -28,13 +28,14 @@ extern "C" {
 #include "fs-uae/fs-uae.h"
 #include <fs/base.h>
 #include <fs/conf.h>
+#include <fs/emu/hacks.h>
 #include <fs/emu/path.h>
 #include <fs/init.h>
 }
 
 namespace {
 
-enum class CommandType { input, pause, reset, floppy, debug, quit };
+enum class CommandType { input, mousePosition, pause, reset, floppy, debug, quit };
 
 struct DebugRequest {
     std::mutex mutex;
@@ -296,6 +297,11 @@ void process_commands(int)
                 case CommandType::input:
                     amiga_send_input_event(command.first, command.second);
                     break;
+                case CommandType::mousePosition:
+                    fs_emu_mouse_absolute_x = command.first;
+                    fs_emu_mouse_absolute_y = command.second;
+                    amiga_send_input_event(INPUTEVENT_MOUSE1_HORIZ, 0);
+                    break;
                 case CommandType::pause:
                     native_paused = command.first != 0;
                     amiga_pause(native_paused);
@@ -343,6 +349,11 @@ void configure_machine()
         fs_uae_configure_host_directory(exchange, "MCP", "MCP", -128);
     }
     fs_uae_configure_cdrom();
+    const char *absolute_mouse = std::getenv("FSUAE_MAC_ABSOLUTE_MOUSE");
+    if (absolute_mouse && absolute_mouse[0]) {
+        amiga_set_option("magic_mouse", "yes");
+        amiga_set_option("absolute_mouse", "mousehack");
+    }
     mouse_port_pending = true;
     drive_status_pending = true;
     fs_uae_configure_directories();
@@ -379,11 +390,41 @@ void *run_engine(void *opaque)
             fs_config_set_string(option_key, override_path);
         }
     }
+    for (int drive = 0; drive < 10; ++drive) {
+        char environment_key[48];
+        char option_key[48];
+        std::snprintf(environment_key, sizeof(environment_key),
+                      "FSUAE_MAC_HARD_DRIVE_%d", drive);
+        const char *override_path = std::getenv(environment_key);
+        if (!override_path || !override_path[0]) {
+            continue;
+        }
+        std::snprintf(option_key, sizeof(option_key), "hard_drive_%d", drive);
+        fs_config_set_string(option_key, override_path);
+        std::snprintf(option_key, sizeof(option_key),
+                      "hard_drive_%d_read_only", drive);
+        std::snprintf(environment_key, sizeof(environment_key),
+                      "FSUAE_MAC_HARD_DRIVE_%d_READ_ONLY", drive);
+        const char *read_only = std::getenv(environment_key);
+        fs_config_set_string(option_key, read_only ? read_only : "0");
+        std::snprintf(option_key, sizeof(option_key), "hard_drive_%d_type", drive);
+        fs_config_set_string(option_key, "");
+        std::snprintf(option_key, sizeof(option_key), "hard_drive_%d_controller", drive);
+        fs_config_set_string(option_key, "uae");
+        std::snprintf(option_key, sizeof(option_key), "hard_drive_%d_priority", drive);
+        fs_config_set_string(option_key, "-128");
+        std::snprintf(option_key, sizeof(option_key), "hard_drive_%d_file_system", drive);
+        fs_config_set_string(option_key, "");
+    }
     native_refresh_rate = fs_config_get_boolean("ntsc_mode") == 1 ? 59.94 : 50.0;
     ++timing_generation;
     fs_uae_init_path_resolver();
     fs_uae_configure_amiga_model();
     amiga_set_video_format(AMIGA_VIDEO_FORMAT_BGRA);
+    fs_emu_video_scale_x = 1.0;
+    fs_emu_video_scale_y = 1.0;
+    fs_emu_video_offset_x = 0.0;
+    fs_emu_video_offset_y = 0.0;
     // Keep the native runtime's Picasso96 mode IDs aligned with FS-UAE 3.x.
     amiga_add_rtg_resolution(672, 540);
     amiga_add_rtg_resolution(960, 540);
@@ -646,6 +687,14 @@ int fsuaemac_queue_mouse_move(int32_t delta_x, int32_t delta_y)
                             delta_y, {}, {}});
     }
     return 1;
+}
+
+int fsuaemac_queue_mouse_position(int32_t x, int32_t y)
+{
+    if (x < 0 || y < 0) {
+        return 0;
+    }
+    return queue_command({CommandType::mousePosition, x, y, {}, {}});
 }
 
 int fsuaemac_queue_mouse_button(uint32_t button, int32_t pressed)

@@ -141,7 +141,17 @@ import Testing
 
     let listedTools = try await request("tools/list")
     let toolsResult = try #require(listedTools["result"] as? [String: Any])
-    #expect((toolsResult["tools"] as? [[String: Any]])?.count == 21)
+    let tools = try #require(toolsResult["tools"] as? [[String: Any]])
+    #expect(tools.count == 22)
+    let start = try #require(tools.first { $0["name"] as? String == "fsuae_machine_start" })
+    let startSchema = try #require(start["inputSchema"] as? [String: Any])
+    let startProperties = try #require(startSchema["properties"] as? [String: Any])
+    #expect(startProperties["hdf"] != nil)
+    #expect(startProperties["hdfs"] != nil)
+    let input = try #require(tools.first { $0["name"] as? String == "fsuae_input" })
+    let inputSchema = try #require(input["inputSchema"] as? [String: Any])
+    let inputProperties = try #require(inputSchema["properties"] as? [String: Any])
+    #expect(inputProperties["event"] != nil)
 
     let listedMachines = try await request("tools/call", params: [
         "name": "fsuae_machines_list", "arguments": [:],

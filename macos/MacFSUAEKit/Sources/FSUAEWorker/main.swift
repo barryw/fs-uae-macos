@@ -79,6 +79,10 @@ struct FSUAEWorker {
             if let x = command["x"] as? Int, let y = command["y"] as? Int {
                 _ = session.sendMouseMove(deltaX: Int32(x), deltaY: Int32(y))
             }
+        case "mouse_position":
+            if let x = command["x"] as? Int, let y = command["y"] as? Int {
+                _ = session.sendMousePosition(x: Int32(x), y: Int32(y))
+            }
         case "mouse_button":
             if let button = command["button"] as? Int,
                let pressed = command["pressed"] as? Bool {

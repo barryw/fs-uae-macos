@@ -405,6 +405,10 @@ public final class MacFSUAEEngineSession: ObservableObject {
         MacFSUAEEngineQueueMouseMove(deltaX, deltaY) != 0
     }
 
+    public func sendMousePosition(x: Int32, y: Int32) -> Bool {
+        MacFSUAEEngineQueueMousePosition(x, y) != 0
+    }
+
     public func sendMouseButton(_ button: UInt32, pressed: Bool) -> Bool {
         MacFSUAEEngineQueueMouseButton(button, pressed ? 1 : 0) != 0
     }
