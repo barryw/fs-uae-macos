@@ -321,6 +321,11 @@ static ALWAYS_INLINE int mmu_get_fc(bool super, bool data)
 	return (super ? 4 : 0) | (data ? 1 : 2);
 }
 
+#if defined(__GNUC__)
+/* Optional host hook, resolved only when the host links one in. */
+extern "C" void uae_cpu_exception_hook(int, uae_u32, uae_u32) __attribute__((weak));
+#endif
+
 void mmu_bus_error(uaecptr addr, int fc, bool write, int size, bool rmw, uae_u32 status, bool nonmmu)
 {
 	if (currprefs.mmu_model == 68040) {
@@ -448,6 +453,17 @@ void mmu_bus_error(uaecptr addr, int fc, bool write, int size, bool rmw, uae_u32
 	}
 
 	regs.mmu_fault_addr = addr;
+
+#if defined(__GNUC__)
+	/* A 040/060 MMU fault reaches Exception(2) by unwinding through THROW,
+	 * and by then only regs.mmu_fault_addr still holds the address that
+	 * faulted. Report it here, where it is exact. The hook keeps the first
+	 * exception it is given, so the Exception(2) call that follows is a
+	 * no-op. */
+	if (uae_cpu_exception_hook) {
+		uae_cpu_exception_hook(2, regs.instruction_pc, addr);
+	}
+#endif
 
 #if 0
 	if (m68k_getpc () == 0x0004B0AC) {

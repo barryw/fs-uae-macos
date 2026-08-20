@@ -2194,7 +2194,10 @@ static void report_exception (int nr)
 #if defined(__GNUC__)
 	if (uae_cpu_exception_hook &&
 		(nr == 2 || nr == 3 || (nr >= 4 && nr <= 7) || nr == 14)) {
-		uae_cpu_exception_hook(nr, M68K_GETPC,
+		/* regs.instruction_pc is the address of the faulting instruction.
+		 * M68K_GETPC has usually moved past it by the time the exception is
+		 * taken, which sends the segment/source lookup to the wrong line. */
+		uae_cpu_exception_hook(nr, regs.instruction_pc,
 			(nr == 2 || nr == 3) ? last_fault_for_exception_3 : 0);
 	}
 #endif

@@ -9,6 +9,7 @@
 #include "uae.h"
 #include "xwin.h"
 #include "uae/fs.h"
+#include <unistd.h>
 #include "../od-win32/debug_win32.h"
 
 #ifndef PICASSO96
@@ -127,6 +128,17 @@ int console_get_gui (TCHAR *out, int maxlen) {
 }
 
 int console_get(TCHAR *in, int maxlen) {
+    /* activate_debugger() drops the emulator thread into debug_1(), which
+     * sits in this function until it gets a line. Inside libfsuaemac there is
+     * no terminal on the other end of stdin, so that read never returns and
+     * the whole machine stops - including the MCP debugger path, which needs
+     * the emulator thread to service it. Report end-of-input instead: the
+     * debugger exits, emulation continues, and the exception is still
+     * recorded through uae_cpu_exception_hook(). A real terminal keeps the
+     * interactive debugger it has always had. */
+    if (!isatty(STDIN_FILENO)) {
+        return -1;
+    }
     TCHAR *res = fgets(in, maxlen, stdin);
     if (res == NULL) {
         return -1;
