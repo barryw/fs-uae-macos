@@ -2322,7 +2322,7 @@ control_init:
 	beq.s .disabled
 	lea control_name(pc),a0
 	lea control_proc(pc),a1
-	moveq #-5,d0
+	moveq #0,d0
 	move.l #8000,d1
 	bsr.w createproc
 .disabled
@@ -2346,6 +2346,11 @@ control_proc:
 	tst.l d0
 	beq.w .free
 	move.l d0,a5
+	; DOS 1.x can deadlock when a filesystem process locks another automounted
+	; filesystem during startup.  Every control path is device-qualified, so
+	; the MCP: current directory is only useful to SystemTagList on DOS 2+.
+	cmp.w #36,20(a5)
+	blo.s .current_ready
 	lea control_current_dir(pc),a0
 	move.l a0,d1
 	moveq #-2,d2 ; ACCESS_READ
@@ -2359,6 +2364,7 @@ control_proc:
 	jsr -$0210(a5) ; SetFileSysTask
 	move.l d3,d1
 	jsr -$007e(a5) ; CurrentDir
+.current_ready
 	move.w #$FF58,d0
 	bsr.w getrtbase
 	move.l a0,a4
@@ -2397,8 +2403,18 @@ control_proc:
 	move.l d0,d4
 	beq.w .delay
 	cmp.w #36,20(a5) ; SystemTagList requires dos.library V36
-	blo.s .execute_old
-	lea control_console(pc),a0
+	blo.w .execute_old
+	; SystemTagList needs distinct input and output handles.  A regular empty
+	; file works across DOS versions without NIL: or CON: handler semantics.
+	lea control_input(pc),a0
+	move.l a0,d1
+	move.l #1006,d2 ; MODE_NEWFILE
+	jsr -$001e(a6) ; Open
+	move.l d0,d3
+	beq.s .launch_failed
+	move.l d3,d1
+	jsr -$0024(a6) ; Close
+	lea control_input(pc),a0
 	move.l a0,d1
 	move.l #1005,d2 ; MODE_OLDFILE
 	jsr -$001e(a6) ; Open
@@ -2408,17 +2424,20 @@ control_proc:
 	clr.l -(sp) ; TAG_DONE
 	move.l #65536,-(sp) ; enough stack for GUI applications and requesters
 	move.l #$800003F3,-(sp) ; NP_StackSize
-	clr.l -(sp) ; NP_WindowPtr data: allow requesters on the default public screen
+	pea control_name(pc)
+	move.l #$800003F4,-(sp) ; NP_Name
+	moveq #-1,d0
+	move.l d0,-(sp) ; NP_WindowPtr data: suppress requesters in the automation process
 	move.l #$800003F7,-(sp) ; NP_WindowPtr
 	move.l d4,-(sp) ; output handle
 	move.l #$80000022,-(sp) ; SYS_Output
 	move.l d3,-(sp) ; input handle gives the child a valid console task
 	move.l #$80000021,-(sp) ; SYS_Input
-	lea 1(a3),a0
+	lea 10(a3),a0
 	move.l a0,d1
 	move.l sp,d2
 	jsr -$025e(a6) ; SystemTagList
-	lea 40(sp),sp
+	lea 48(sp),sp
 	move.l d0,d6 ; real command return code
 	move.l d3,d1
 	jsr -$0024(a6) ; Close
@@ -2429,7 +2448,7 @@ control_proc:
 	moveq #1,d7
 	bra.s .close_output
 .execute_old
-	lea 1(a3),a0
+	lea 10(a3),a0
 	move.l a0,d1
 	moveq #0,d2
 	move.l d4,d3
@@ -2448,11 +2467,11 @@ control_proc:
 
 .put
 	lea control_transfer(pc),a0
-	lea 1(a3),a1
+	lea 10(a3),a1
 	bsr.s control_copy
 	bra.s .copy_result
 .get
-	lea 1(a3),a0
+	lea 10(a3),a0
 	lea control_transfer(pc),a1
 	bsr.s control_copy
 .copy_result
@@ -2484,7 +2503,7 @@ control_proc:
 	beq.w .delay
 	move.l d4,d1
 	move.l a3,d2
-	moveq #6,d3
+	moveq #10,d3
 	jsr -$0030(a6) ; Write
 	move.l d4,d1
 	jsr -$0024(a6) ; Close
@@ -2503,6 +2522,7 @@ control_proc:
 
 ; Copy A0 to A1 with only the original DOS calls available on Kickstart 1.2.
 control_copy:
+	move.l 6(a3),-(sp) ; preserve the request token while a3 is the copy buffer
 	move.l a1,d6
 	move.l a0,d1
 	move.l #1005,d2 ; MODE_OLDFILE
@@ -2542,6 +2562,7 @@ control_copy:
 	move.l d4,d1
 	jsr -$0024(a6) ; Close
 .failed
+	move.l (sp)+,6(a3)
 	moveq #0,d0
 	rts
 .succeeded
@@ -2549,6 +2570,7 @@ control_copy:
 	jsr -$0024(a6) ; Close
 	move.l d4,d1
 	jsr -$0024(a6) ; Close
+	move.l (sp)+,6(a3)
 	moveq #1,d0
 	rts
 
@@ -3189,7 +3211,7 @@ pointer_prefs: dc.b 'RAM:Env/Sys/Pointer.prefs',0
 clname: dc.b 'UAE clipboard sharing',0
 control_name: dc.b 'FS-UAE Mac control',0
 control_current_dir: dc.b 'MCP:',0
-control_console: dc.b 'CON:0/0/1/1/MCP/AUTO/CLOSE/WAIT',0
+control_input: dc.b 'MCP:FSUAE-Control-Input',0
 control_command: dc.b 'MCP:FSUAE-Control-Command',0
 control_output: dc.b 'MCP:FSUAE-Control-Output',0
 control_status: dc.b 'MCP:FSUAE-Control-Status',0

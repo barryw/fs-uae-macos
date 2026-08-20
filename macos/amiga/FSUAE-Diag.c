@@ -2,6 +2,7 @@
 #include <exec/io.h>
 #include <exec/ports.h>
 #include <proto/exec.h>
+#include <proto/dos.h>
 #include <clib/alib_protos.h>
 #include <ctype.h>
 #include <stdio.h>
@@ -110,8 +111,12 @@ int main(int argc, char **argv)
         result = issue(io, FSUAEDEV_CLEAR_LOG, NULL, 0, 0) ? 10 : 0;
     } else if (!strcmp(command, "SELFTEST")) {
         result = status(io) || ping(io) || log_output(io) ? 10 : 0;
+    } else if (!strcmp(command, "WAIT")) {
+        Delay(150);
+        puts("WAIT ok");
+        result = 0;
     } else {
-        puts("Usage: FSUAE-Diag [STATUS|PING|LOG|CLEARLOG|SELFTEST]");
+        puts("Usage: FSUAE-Diag [STATUS|PING|LOG|CLEARLOG|SELFTEST|WAIT]");
     }
 
     CloseDevice((struct IORequest *)io);

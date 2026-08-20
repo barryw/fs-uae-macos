@@ -100,7 +100,13 @@ struct FSUAEWorker {
                 session.ejectFloppy(drive)
             }
         case "audio": session.setAudioEnabled(command["enabled"] as? Bool ?? false)
-        case "clear_exception": session.clearException()
+        case "clear_exception":
+            session.clearException(taskName: command["task_name"] as? String)
+            if let acknowledgement = command["acknowledgement"] as? String,
+               UUID(uuidString: acknowledgement) != nil {
+                fputs("FSUAE_ACK \(acknowledgement)\n", stderr)
+                fflush(stderr)
+            }
         case "debug":
             guard let request = command["request_id"] as? String,
                   UUID(uuidString: request) != nil,

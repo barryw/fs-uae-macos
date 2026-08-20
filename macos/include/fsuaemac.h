@@ -87,7 +87,7 @@ FSUAE_MAC_API void fsuaemac_set_drive_status_callback(
 FSUAE_MAC_API int fsuaemac_start(const fsuaemac_configuration *configuration);
 FSUAE_MAC_API int fsuaemac_is_running(void);
 FSUAE_MAC_API int fsuaemac_get_health(fsuaemac_health *health);
-FSUAE_MAC_API void fsuaemac_clear_exception(void);
+FSUAE_MAC_API void fsuaemac_clear_exception(const char *task_name);
 FSUAE_MAC_API void fsuaemac_stop(void);
 FSUAE_MAC_API int fsuaemac_queue_input(int32_t event, int32_t state);
 FSUAE_MAC_API int fsuaemac_queue_key(uint16_t mac_key_code, int32_t pressed);

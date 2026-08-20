@@ -14,6 +14,20 @@ import Testing
     #expect(source.latest(after: 1) == nil)
 }
 
+@Test func guestStatusRejectsPartialAndStaleResponses() {
+    let token: UInt32 = 0x1234_5678
+    let completed = Data([0x31, 0x31, 0, 0, 0, 0, 0x12, 0x34, 0x56, 0x78])
+
+    #expect(parseGuestStatus(completed, token: token) ==
+        MacFSUAEGuestStatus(succeeded: true, exitCode: 0))
+    #expect(parseGuestStatus(completed.dropLast(), token: token) == nil)
+    #expect(parseGuestStatus(completed, token: 0x1234_5679) == nil)
+
+    let failed = Data([0x30, 0x31, 0xff, 0xff, 0xff, 0xfb, 0x12, 0x34, 0x56, 0x78])
+    #expect(parseGuestStatus(failed, token: token) ==
+        MacFSUAEGuestStatus(succeeded: false, exitCode: -5))
+}
+
 @Test func driveStatusUpdatesMediaAndAggregateHardDiskActivity() {
     var drives: [MacFSUAEDrive] = []
     drives = updatingDriveStatuses(drives, with: MacFSUAEDrive(

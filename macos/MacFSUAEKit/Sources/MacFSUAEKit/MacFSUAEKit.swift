@@ -355,9 +355,13 @@ public final class MacFSUAEEngineSession: ObservableObject {
             exceptionTaskName: taskName)
     }
 
-    public func clearException() {
+    public func clearException(taskName: String? = nil) {
         guard isRunning else { return }
-        MacFSUAEEngineClearException()
+        if let taskName {
+            taskName.withCString { MacFSUAEEngineClearException($0) }
+        } else {
+            MacFSUAEEngineClearException(nil)
+        }
     }
 
     public func debugCommand(_ command: String) -> String? {

@@ -2189,7 +2189,7 @@ extern "C" void uae_cpu_exception_hook(int, uae_u32, uae_u32)
     __attribute__((weak));
 #endif
 
-static void exception_debug (int nr)
+static void report_exception (int nr)
 {
 #if defined(__GNUC__)
 	if (uae_cpu_exception_hook &&
@@ -2198,6 +2198,10 @@ static void exception_debug (int nr)
 			(nr == 2 || nr == 3) ? last_fault_for_exception_3 : 0);
 	}
 #endif
+}
+
+static void exception_debug (int nr)
+{
 #ifdef DEBUGGER
 	if (!exception_debugging)
 		return;
@@ -2975,6 +2979,7 @@ kludge_me_do:
 // address = format $2 stack frame address field
 static void ExceptionX (int nr, uaecptr address)
 {
+	report_exception (nr);
 	regs.exception = nr;
 	if (cpu_tracer) {
 #ifdef FSUAE

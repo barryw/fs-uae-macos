@@ -40,6 +40,23 @@ private struct MCPHTTPRequest: Sendable {
     let body: Data
 }
 
+struct MacFSUAEGuestStatus: Equatable {
+    let succeeded: Bool
+    let exitCode: Int?
+}
+
+func parseGuestStatus(_ data: Data, token: UInt32) -> MacFSUAEGuestStatus? {
+    guard data.count >= 10 else { return nil }
+    let responseToken = data[6..<10].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+    guard responseToken == token else { return nil }
+    let exitCode: Int? = if data[1] == 0x31 {
+        Int(Int32(bitPattern: data[2..<6].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }))
+    } else {
+        nil
+    }
+    return MacFSUAEGuestStatus(succeeded: data[0] == 0x31, exitCode: exitCode)
+}
+
 private final class MCPHTTPServer: @unchecked Sendable {
     typealias Handler = @Sendable (Data) async -> MCPHTTPReply
 
@@ -221,11 +238,16 @@ public final class MacFSUAEMCPServer: ObservableObject {
         let machineID: String
         let operation: GuestOperation
         let started: Date
+        let token: UInt32
+        let exceptionSequence: UInt64
+        let taskName: String?
         var timedOut = false
+        var failure: String?
     }
     private var guestCommands: [String: GuestRequest] = [:]
     private var guestCommandByMachine: [String: String] = [:]
     private var workerOutputBuffers: [String: String] = [:]
+    private var workerAcknowledgements: [String: Set<String>] = [:]
     private var workerHealthDates: [String: Date] = [:]
     private var workerGuestHeartbeatDates: [String: Date] = [:]
     private var workerGuestHeartbeats: [String: UInt32] = [:]
@@ -598,13 +620,13 @@ public final class MacFSUAEMCPServer: ObservableObject {
                               required: ["machine_id", "name"])),
             tool("fsuae_command_run", "Run an AmigaDOS command through the guest service and return a request id.",
                  stringSchema(["machine_id": "Running machine UUID",
-                               "command": "AmigaDOS command line (4095-byte maximum)"],
+                               "command": "AmigaDOS command line (4085-byte maximum)"],
                               required: ["machine_id", "command"])),
-            tool("fsuae_command_execute", "Run a program or AmigaDOS command, wait for completion, and return captured output and a truthful exit-code status.", [
+            tool("fsuae_command_execute", "Run a program or AmigaDOS command, wait for completion, and return captured output and a truthful exit-code status. DOS 1.x reports exit_code_known=false because Execute only reports launch success.", [
                 "type": "object",
                 "properties": [
                     "machine_id": ["type": "string", "description": "Running machine UUID"],
-                    "command": ["type": "string", "description": "Program or AmigaDOS command line (4095-byte maximum)"],
+                    "command": ["type": "string", "description": "Program or AmigaDOS command line (4085-byte maximum)"],
                     "timeout_seconds": ["type": "integer", "minimum": 1, "maximum": 300,
                                         "default": 30, "description": "Maximum wait before returning a pollable request id"],
                 ],
@@ -670,7 +692,7 @@ public final class MacFSUAEMCPServer: ObservableObject {
             }.joined()
             return "Started \(configuration.name) (\(configuration.model)); machine_id \(machine.id); pid \(machine.processIdentifier)\(attachment)"
         case "fsuae_machine_stop":
-            return try stopMachine(arguments)
+            return try await stopMachine(arguments)
         case "fsuae_machines_list":
             return try machinesJSON()
         case "fsuae_machine_wait":
@@ -855,7 +877,7 @@ public final class MacFSUAEMCPServer: ObservableObject {
         }
     }
 
-    private func stopMachine(_ arguments: [String: Any]) throws -> String {
+    private func stopMachine(_ arguments: [String: Any]) async throws -> String {
         let requestedMachine = optionalString("machine_id", in: arguments)
         let requestedConfiguration = optionalString("configuration", in: arguments)
         if let requestedMachine {
@@ -866,7 +888,7 @@ public final class MacFSUAEMCPServer: ObservableObject {
                 foregroundMachineID = nil
                 return "Stopped machine \(requestedMachine)"
             }
-            return try stopWorker(requestedMachine)
+            return try await stopWorkerAndWait(requestedMachine)
         }
 
         if let requestedConfiguration {
@@ -886,7 +908,7 @@ public final class MacFSUAEMCPServer: ObservableObject {
                 foregroundMachineID = nil
                 return "Stopped machine \(id ?? requestedConfiguration)"
             }
-            return try stopWorker(matches[0].id)
+            return try await stopWorkerAndWait(matches[0].id)
         }
 
         let count = runningMachines.count + (session.isRunning ? 1 : 0)
@@ -899,7 +921,28 @@ public final class MacFSUAEMCPServer: ObservableObject {
             foregroundMachineID = nil
             return "Stopped machine \(id ?? "foreground")"
         }
-        return try stopWorker(runningMachines[0].id)
+        return try await stopWorkerAndWait(runningMachines[0].id)
+    }
+
+    private func stopWorkerAndWait(_ id: String) async throws -> String {
+        guard let process = workerProcesses[id] else { throw MCPFailure("No running machine \(id)") }
+        _ = try stopWorker(id)
+        var deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while process.isRunning && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        if process.isRunning {
+            _ = Darwin.kill(process.processIdentifier, SIGKILL)
+            deadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while process.isRunning && ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+        }
+        guard !process.isRunning else {
+            throw MCPFailure("Machine \(id) did not stop after SIGKILL")
+        }
+        removeWorker(id)
+        return "Stopped machine \(id)"
     }
 
     private func stopWorker(_ id: String) throws -> String {
@@ -936,6 +979,7 @@ public final class MacFSUAEMCPServer: ObservableObject {
         guestCommands.removeAll()
         guestCommandByMachine.removeAll()
         workerOutputBuffers.removeAll()
+        workerAcknowledgements.removeAll()
         workerHealthDates.removeAll()
         workerGuestHeartbeatDates.removeAll()
         workerGuestHeartbeats.removeAll()
@@ -959,6 +1003,7 @@ public final class MacFSUAEMCPServer: ObservableObject {
             try? FileManager.default.removeItem(atPath: path)
         }
         workerOutputBuffers[id] = nil
+        workerAcknowledgements[id] = nil
         workerHealthDates[id] = nil
         workerGuestHeartbeatDates[id] = nil
         workerGuestHeartbeats[id] = nil
@@ -1009,6 +1054,9 @@ public final class MacFSUAEMCPServer: ObservableObject {
                 consumeHealth(id, fields: line.split(separator: " "))
             } else if line.hasPrefix("FSUAE_DRIVES ") {
                 consumeDrives(id, encoded: String(line.dropFirst("FSUAE_DRIVES ".count)))
+            } else if line.hasPrefix("FSUAE_ACK ") {
+                workerAcknowledgements[id, default: []]
+                    .insert(String(line.dropFirst("FSUAE_ACK ".count)))
             }
         }
         workerOutputBuffers[id] = String(buffer.suffix(4096))
@@ -1056,13 +1104,20 @@ public final class MacFSUAEMCPServer: ObservableObject {
             Data(base64Encoded: String(fields[16])).map { String(decoding: $0, as: UTF8.self) } ?? ""
         runningMachines[index].guestControlGeneration = guestGeneration
         let now = Date()
-        if workerGuestHeartbeats[id] != guestHeartbeat {
+        if workerGuestHeartbeats[id] == nil {
+            workerGuestHeartbeats[id] = guestHeartbeat
+            if guestHeartbeat != 0 { workerGuestHeartbeatDates[id] = now }
+        } else if workerGuestHeartbeats[id] != guestHeartbeat {
             workerGuestHeartbeats[id] = guestHeartbeat
             workerGuestHeartbeatDates[id] = now
         }
         let resetPending: Bool
         if let baseline = workerResetGenerationBaselines[id], guestGeneration != baseline {
             workerResetGenerationBaselines[id] = nil
+            workerAlertBaselines[id] = alert
+            if runningMachines[index].status == "booting" {
+                runningMachines[index].status = "running"
+            }
             resetPending = false
         } else {
             resetPending = workerResetGenerationBaselines[id] != nil
@@ -1118,7 +1173,7 @@ public final class MacFSUAEMCPServer: ObservableObject {
         let guestControlAge = workerGuestHeartbeatDates[machine.id].map {
             Date().timeIntervalSince($0)
         }
-        let stale = (machine.status == "running" && (heartbeatAge ?? 0) > 3) ||
+        let stale = (machine.status == "running" && (heartbeatAge ?? 0) > 10) ||
             (machine.status == "booting" && (heartbeatAge ?? 0) > 10)
         var status = stale ? "unresponsive" : machine.status
         var row: [String: Any] = [
@@ -1132,7 +1187,7 @@ public final class MacFSUAEMCPServer: ObservableObject {
         ]
         if let heartbeatAge { row["health_age_seconds"] = heartbeatAge }
         if let guestControlAge { row["guest_control_age_seconds"] = guestControlAge }
-        if machine.exceptionSequence != 0 {
+        if machine.exceptionVector != 0 {
             var exception: [String: Any] = [
                 "sequence": machine.exceptionSequence,
                 "vector": machine.exceptionVector,
@@ -1153,10 +1208,15 @@ public final class MacFSUAEMCPServer: ObservableObject {
            let request = guestCommands[requestID] {
             row["guest_request_id"] = requestID
             row["guest_command_age_seconds"] = Date().timeIntervalSince(request.started)
-            row["guest_command_status"] = request.timedOut ? "timeout" : "running"
-            if request.timedOut, status != "guruing" {
-                status = machine.exceptionSequence == 0
-                    ? "guest_command_timed_out" : "guest_crashed"
+            row["guest_command_status"] = request.failure != nil ? "failed" :
+                request.timedOut ? "timeout" : "running"
+            if let failure = request.failure {
+                row["guest_command_failure"] = failure
+                if status != "guruing" { row["status"] = "guest_service_failed" }
+            } else if request.timedOut, status != "guruing" {
+                status = exceptionBelongsToGuestCommand(machine, request) &&
+                    (guestControlAge ?? 0) > 3
+                    ? "guest_crashed" : "guest_command_timed_out"
                 row["status"] = status
             }
         }
@@ -1287,8 +1347,8 @@ public final class MacFSUAEMCPServer: ObservableObject {
             guard workerProcesses[machineID]?.isRunning == true else {
                 throw MCPFailure("Machine \(machineID) stopped while booting")
             }
-            if runningMachines.first(where: { $0.id == machineID })?.status == "guruing" {
-                throw MCPFailure("Machine \(machineID) entered a Guru Meditation while booting")
+            if let failure = guestFailure(machineID) {
+                throw MCPFailure("Machine \(machineID) failed while booting: \(failure)")
             }
             guard ContinuousClock.now < deadline else {
                 throw MCPFailure("Workbench did not become ready within \(timeout) seconds; guest control never became available")
@@ -1372,6 +1432,12 @@ public final class MacFSUAEMCPServer: ObservableObject {
             workerResetGenerationBaselines[machineID] =
                 runningMachines[index].guestControlGeneration
             runningMachines[index].guestControlReady = false
+            runningMachines[index].status = "booting"
+            runningMachines[index].exceptionVector = 0
+            runningMachines[index].exceptionPC = 0
+            runningMachines[index].exceptionAddress = 0
+            runningMachines[index].exceptionTask = 0
+            runningMachines[index].exceptionTaskName = ""
         }
         clearGuestRequest(machineID)
         return try jsonText(["machine_id": machineID,
@@ -1514,8 +1580,8 @@ public final class MacFSUAEMCPServer: ObservableObject {
     private func guestCommandRun(_ arguments: [String: Any]) async throws -> String {
         let machineID = try requiredString("machine_id", in: arguments)
         let command = try requiredString("command", in: arguments)
-        guard let data = command.data(using: .isoLatin1), !data.contains(0), data.count <= 4095 else {
-            throw MCPFailure("command must be Latin-1 text of 4095 bytes or less")
+        guard let data = command.data(using: .isoLatin1), !data.contains(0), data.count <= 4085 else {
+            throw MCPFailure("command must be Latin-1 text of 4085 bytes or less")
         }
         return try await startGuestRequest(machineID: machineID,
                                            payload: Data([0x43]) + data,
@@ -1529,15 +1595,27 @@ public final class MacFSUAEMCPServer: ObservableObject {
             throw MCPFailure("timeout_seconds must be between 1 and 300")
         }
         _ = try await guestCommandRun(arguments)
-        guard let request = guestCommandByMachine[machineID] else {
+        guard let request = guestCommandByMachine[machineID],
+              let startedRequest = guestCommands[request] else {
             throw MCPFailure("Could not start command on machine \(machineID)")
         }
         let deadline = ContinuousClock.now.advanced(by: .seconds(timeout))
         repeat {
+            guard guestCommands[request] != nil else {
+                throw MCPFailure("Guest command was cancelled by a reset or machine stop")
+            }
             let statusURL = try exchangeURL(machineID: machineID,
                                             name: "FSUAE-Control-Status")
-            if let status = try? Data(contentsOf: statusURL), status.count >= 6 {
+            if let status = try? Data(contentsOf: statusURL),
+               parseGuestStatus(status, token: startedRequest.token) != nil {
                 return try guestCommandResult(["request_id": request])
+            }
+            if let failure = guestFailure(machineID, request: startedRequest) {
+                if var guestRequest = guestCommands[request] {
+                    guestRequest.failure = failure
+                    guestCommands[request] = guestRequest
+                }
+                throw MCPFailure("Guest command failed: \(failure)")
             }
             try await Task.sleep(for: .milliseconds(25))
         } while ContinuousClock.now < deadline
@@ -1548,6 +1626,41 @@ public final class MacFSUAEMCPServer: ObservableObject {
         return try jsonText(["machine_id": machineID, "request_id": request,
                              "status": "timeout",
                              "message": "Command did not complete; inspect diagnostics, then hard-reset the machine to recover"])
+    }
+
+    private func guestFailure(_ machineID: String, request: GuestRequest? = nil) -> String? {
+        guard workerProcesses[machineID]?.isRunning == true else {
+            return "worker stopped"
+        }
+        guard let machine = runningMachines.first(where: { $0.id == machineID }) else {
+            return "machine disappeared"
+        }
+        if machine.status == "guruing" {
+            return "Guru Meditation " + machine.lastAlert.map {
+                String(format: "0x%08x", $0)
+            }.joined(separator: " ")
+        }
+        if let request, exceptionBelongsToGuestCommand(machine, request) {
+            var failure = "CPU exception \(machine.exceptionVector) " +
+                exceptionName(machine.exceptionVector) +
+                String(format: " at 0x%08x", machine.exceptionPC)
+            if !machine.exceptionTaskName.isEmpty {
+                failure += " in \(machine.exceptionTaskName)"
+            }
+            return failure
+        }
+        if let health = workerHealthDates[machineID], Date().timeIntervalSince(health) > 10 {
+            return "worker health heartbeat stopped"
+        }
+        return nil
+    }
+
+    private func exceptionBelongsToGuestCommand(_ machine: MacFSUAERunningMachine,
+                                                 _ request: GuestRequest) -> Bool {
+        guard machine.exceptionVector != 0,
+              machine.exceptionSequence != request.exceptionSequence,
+              let taskName = request.taskName else { return false }
+        return machine.exceptionTaskName.caseInsensitiveCompare(taskName) == .orderedSame
     }
 
     private func guestFilePut(_ arguments: [String: Any]) async throws -> String {
@@ -1571,8 +1684,8 @@ public final class MacFSUAEMCPServer: ObservableObject {
 
     private func guestPath(in arguments: [String: Any]) throws -> Data {
         let path = try requiredString("path", in: arguments)
-        guard let data = path.data(using: .isoLatin1), !data.contains(0), data.count <= 4094 else {
-            throw MCPFailure("path must be Latin-1 text of 4094 bytes or less")
+        guard let data = path.data(using: .isoLatin1), !data.contains(0), data.count <= 4085 else {
+            throw MCPFailure("path must be Latin-1 text of 4085 bytes or less")
         }
         return data
     }
@@ -1595,13 +1708,39 @@ public final class MacFSUAEMCPServer: ObservableObject {
         } else {
             try? FileManager.default.removeItem(at: transferURL)
         }
-        guard sendWorkerCommand(machineID, ["command": "clear_exception"]) else {
+        let taskName = operation == .command ? "FS-UAE Mac control" : nil
+        let acknowledgement = UUID().uuidString.lowercased()
+        var preparation: [String: Any] = ["command": "clear_exception",
+                                          "acknowledgement": acknowledgement]
+        if let taskName { preparation["task_name"] = taskName }
+        guard sendWorkerCommand(machineID, preparation) else {
             throw MCPFailure("Could not prepare guest command on machine \(machineID)")
         }
-        try payload.write(to: commandURL, options: .atomic)
+        let acknowledgementDeadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while workerAcknowledgements[machineID]?.remove(acknowledgement) == nil {
+            guard workerProcesses[machineID]?.isRunning == true else {
+                throw MCPFailure("Machine \(machineID) stopped while preparing a guest command")
+            }
+            guard ContinuousClock.now < acknowledgementDeadline else {
+                throw MCPFailure("Worker did not acknowledge guest-command preparation")
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let token = UInt32.random(in: UInt32.min...UInt32.max)
+        let exceptionSequence = runningMachines.first(where: { $0.id == machineID })?
+            .exceptionSequence ?? 0
+        var encodedToken = token.bigEndian
+        var wirePayload = Data([payload[0]])
+        wirePayload.append(Data(repeating: 0, count: 5))
+        withUnsafeBytes(of: &encodedToken) { wirePayload.append(contentsOf: $0) }
+        wirePayload.append(payload.dropFirst())
+        try wirePayload.write(to: commandURL, options: .atomic)
         let request = UUID().uuidString.lowercased()
         guestCommands[request] = GuestRequest(machineID: machineID,
-                                              operation: operation, started: Date())
+                                              operation: operation, started: Date(),
+                                              token: token,
+                                              exceptionSequence: exceptionSequence,
+                                              taskName: taskName)
         guestCommandByMachine[machineID] = request
         return try jsonText(["machine_id": machineID, "request_id": request,
                              "status": "running"])
@@ -1609,7 +1748,7 @@ public final class MacFSUAEMCPServer: ObservableObject {
 
     private func waitForGuestControl(_ machineID: String,
                                      after heartbeat: UInt32? = nil) async throws {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
         repeat {
             guard workerProcesses[machineID]?.isRunning == true else {
                 throw MCPFailure("No running machine \(machineID)")
@@ -1629,9 +1768,18 @@ public final class MacFSUAEMCPServer: ObservableObject {
             throw MCPFailure("No guest command request \(request)")
         }
         let machineID = guestRequest.machineID
+        if let failure = guestRequest.failure ?? guestFailure(machineID, request: guestRequest) {
+            if guestRequest.failure == nil {
+                var failedRequest = guestRequest
+                failedRequest.failure = failure
+                guestCommands[request] = failedRequest
+            }
+            return try jsonText(["machine_id": machineID, "request_id": request,
+                                 "status": "failed", "message": failure])
+        }
         let statusURL = try exchangeURL(machineID: machineID, name: "FSUAE-Control-Status")
-        guard let status = try? Data(contentsOf: statusURL), status.count >= 6,
-              let byte = status.first else {
+        guard let status = try? Data(contentsOf: statusURL),
+              let parsed = parseGuestStatus(status, token: guestRequest.token) else {
             if guestRequest.timedOut {
                 return try jsonText(["machine_id": machineID, "request_id": request,
                                      "status": "timeout",
@@ -1641,34 +1789,34 @@ public final class MacFSUAEMCPServer: ObservableObject {
                                  "status": "running"])
         }
         let outputURL = try exchangeURL(machineID: machineID, name: "FSUAE-Control-Output")
-        let output = (try? Data(contentsOf: outputURL)) ?? Data()
-        guard output.count <= 16 * 1_048_576 else {
+        let transferURL = try exchangeURL(machineID: machineID, name: "FSUAE-Control-Transfer")
+        defer {
+            guestCommands[request] = nil
+            if guestCommandByMachine[machineID] == request { guestCommandByMachine[machineID] = nil }
+            for url in [outputURL, statusURL, transferURL] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        let outputSize = (try? outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        guard outputSize <= 16 * 1_048_576 else {
             throw MCPFailure("Command output exceeds 16 MiB")
         }
-        guestCommands[request] = nil
-        guestCommandByMachine[machineID] = nil
-        try? FileManager.default.removeItem(at: outputURL)
-        try? FileManager.default.removeItem(at: statusURL)
-        let exitCodeKnown = status.count >= 6 && status[1] == 0x31
+        let output = (try? Data(contentsOf: outputURL)) ?? Data()
         var result: [String: Any] = ["machine_id": machineID, "request_id": request,
-                                     "status": "completed", "succeeded": byte == 0x31,
-                                     "exit_code_known": exitCodeKnown]
-        if exitCodeKnown {
-            let raw = status[2...5].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
-            result["exit_code"] = Int(Int32(bitPattern: raw))
-        }
+                                     "status": "completed", "succeeded": parsed.succeeded,
+                                     "exit_code_known": parsed.exitCode != nil]
+        if let exitCode = parsed.exitCode { result["exit_code"] = exitCode }
         if guestRequest.operation == .command {
             result["output"] = String(data: output, encoding: .isoLatin1) ?? ""
             result["output_base64"] = output.base64EncodedString()
         }
-        let transferURL = try exchangeURL(machineID: machineID, name: "FSUAE-Control-Transfer")
-        if guestRequest.operation == .get, byte == 0x31 {
+        if guestRequest.operation == .get, parsed.succeeded {
+            let size = try transferURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+            guard size <= 16 * 1_048_576 else { throw MCPFailure("File exceeds 16 MiB") }
             let data = try Data(contentsOf: transferURL)
-            guard data.count <= 16 * 1_048_576 else { throw MCPFailure("File exceeds 16 MiB") }
             result["size"] = data.count
             result["data_base64"] = data.base64EncodedString()
         }
-        if guestRequest.operation != .command { try? FileManager.default.removeItem(at: transferURL) }
         return try jsonText(result)
     }
 

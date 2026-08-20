@@ -6,6 +6,9 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 
 cd "$PROJECT_DIR"
+if [ src/filesys.asm -nt src/filesys_bootrom.cpp ]; then
+    macos/scripts/build-filesys-bootrom.sh
+fi
 if [ ! -x configure ] || [ Makefile.am -nt configure ] || \
         ! grep -q 'ac_unique_file="src/main.cpp"' configure; then
     ./bootstrap

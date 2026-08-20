@@ -83,27 +83,32 @@ std::atomic<uint32_t> health_program_counter{0};
 std::atomic<uint32_t> health_exec_base{0};
 std::atomic<uint32_t> health_last_alert[4];
 std::atomic<uint64_t> health_exception_sequence{0};
+std::atomic<bool> health_exception_active{false};
 std::atomic<uint32_t> health_exception_vector{0};
 std::atomic<uint32_t> health_exception_pc{0};
 std::atomic<uint32_t> health_exception_address{0};
 std::atomic<uint32_t> health_exception_task{0};
 std::mutex health_exception_mutex;
 char health_exception_task_name[64];
+char health_exception_task_filter[64];
 double native_refresh_rate = 50.0;
 bool floppy_active[4];
 int floppy_count;
 
 int configured_floppy_count();
 
-void clear_exception_health()
+void clear_exception_health(const char *task_name = nullptr)
 {
     std::lock_guard<std::mutex> lock(health_exception_mutex);
-    health_exception_sequence = 0;
+    health_exception_active = false;
     health_exception_vector = 0;
     health_exception_pc = 0;
     health_exception_address = 0;
     health_exception_task = 0;
     health_exception_task_name[0] = '\0';
+    std::snprintf(health_exception_task_filter,
+                  sizeof(health_exception_task_filter), "%s",
+                  task_name ? task_name : "");
 }
 
 void pace_frame()
@@ -482,7 +487,9 @@ void uae_cpu_exception_hook(int vector, uae_u32 pc, uae_u32 address)
     }
 
     std::lock_guard<std::mutex> lock(health_exception_mutex);
-    if (health_exception_sequence != 0) return;
+    if (health_exception_task_filter[0] &&
+        std::strcmp(health_exception_task_filter, task_name) != 0) return;
+    if (health_exception_active) return;
     health_exception_vector = static_cast<uint32_t>(vector);
     health_exception_pc = pc;
     health_exception_address = address;
@@ -490,6 +497,7 @@ void uae_cpu_exception_hook(int vector, uae_u32 pc, uae_u32 address)
     std::snprintf(health_exception_task_name,
                   sizeof(health_exception_task_name), "%s", task_name);
     ++health_exception_sequence;
+    health_exception_active = true;
 }
 
 void fsuaemac_set_video_callback(fsuaemac_video_callback callback, void *context)
@@ -589,9 +597,9 @@ int fsuaemac_get_health(fsuaemac_health *health)
     return 1;
 }
 
-void fsuaemac_clear_exception(void)
+void fsuaemac_clear_exception(const char *task_name)
 {
-    clear_exception_health();
+    clear_exception_health(task_name);
 }
 
 void fsuaemac_stop(void)

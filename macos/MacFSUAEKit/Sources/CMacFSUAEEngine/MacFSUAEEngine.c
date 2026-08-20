@@ -12,7 +12,7 @@ typedef struct Symbols {
     int (*start)(const fsuaemac_configuration *);
     int (*isRunning)(void);
     int (*getHealth)(fsuaemac_health *);
-    void (*clearException)(void);
+    void (*clearException)(const char *);
     void (*stop)(void);
     int (*queueKey)(uint16_t, int32_t);
     int (*queueMouseMove)(int32_t, int32_t);
@@ -115,7 +115,7 @@ int MacFSUAEEngineStart(const fsuaemac_configuration *configuration)
 
 int MacFSUAEEngineIsRunning(void) { return symbols.isRunning ? symbols.isRunning() : 0; }
 int MacFSUAEEngineGetHealth(fsuaemac_health *health) { return symbols.getHealth ? symbols.getHealth(health) : 0; }
-void MacFSUAEEngineClearException(void) { if (symbols.clearException) symbols.clearException(); }
+void MacFSUAEEngineClearException(const char *taskName) { if (symbols.clearException) symbols.clearException(taskName); }
 void MacFSUAEEngineStop(void) { if (symbols.stop) symbols.stop(); }
 int MacFSUAEEngineQueueKey(uint16_t key, int32_t pressed) { return symbols.queueKey ? symbols.queueKey(key, pressed) : 0; }
 int MacFSUAEEngineQueueMouseMove(int32_t deltaX, int32_t deltaY) { return symbols.queueMouseMove ? symbols.queueMouseMove(deltaX, deltaY) : 0; }
