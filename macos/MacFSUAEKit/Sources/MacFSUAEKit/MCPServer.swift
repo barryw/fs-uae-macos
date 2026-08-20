@@ -1967,12 +1967,40 @@ public final class MacFSUAEMCPServer: ObservableObject {
         }
         let line = try debuggerLine("Zf '\(seglist)' '\(hostPath)'")
         let result = try await runDebugger(machineID, [line])
-        // Zf reports failure in prose, so read the outcome from the text.
-        let loaded = result.succeeded && result.output.contains("segments")
-            && !result.output.contains("Cannot load")
-        return try jsonText(["machine_id": machineID, "seglist": seglist,
-                             "host_path": hostPath, "loaded": loaded,
-                             "output": result.output])
+        // Zf reports every outcome in prose, so read it back out of the text.
+        let failures = ["Error adding debug info", "Error loading hunk file",
+                        "No loaded segment list", "Usage: Zf"]
+        let failure = failures.first { result.output.contains($0) }
+        var payload: [String: Any] = [
+            "machine_id": machineID, "seglist": seglist, "host_path": hostPath,
+            "loaded": result.succeeded && failure == nil,
+            "output": result.output,
+        ]
+        if let failure {
+            payload["error"] = failure
+        } else {
+            // A file with no debug hunks loads without complaint and resolves
+            // nothing, which is the easiest way to lose an afternoon.
+            let totals = countDebugInfo(result.output)
+            payload["symbols"] = totals.symbols
+            payload["source_files"] = totals.sourceFiles
+            if totals.symbols == 0, totals.sourceFiles == 0 {
+                payload["note"] = "Loaded, but the file carries no debug hunks: addresses will resolve to a segment and no further. Relink the executable with debug information."
+            }
+        }
+        return try jsonText(payload)
+    }
+
+    /// Totals the counts debug_info_dump_file() prints per segment:
+    /// `  segment #00: CODE [000021c8]  123 symbols,    4 src files`
+    func countDebugInfo(_ output: String) -> (symbols: Int, sourceFiles: Int) {
+        var symbols = 0
+        var sourceFiles = 0
+        for line in output.split(separator: "\n") where line.contains("segment #") {
+            symbols += countBefore("symbols", in: String(line)) ?? 0
+            sourceFiles += countBefore("src files", in: String(line)) ?? 0
+        }
+        return (symbols, sourceFiles)
     }
 
     private func debugResolve(_ arguments: [String: Any]) async throws -> String {

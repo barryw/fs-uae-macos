@@ -297,3 +297,25 @@ private func segtrackerParser() -> MacFSUAEMCPServer {
     #expect(server.parseHex("nothex") == nil)
     #expect(server.parseHex("1234567890") == nil)
 }
+
+@MainActor
+@Test func countsDebugHunksInLoadOutput() {
+    let server = segtrackerParser()
+    // Real Zf output for a file linked without debug information.
+    let bare = server.countDebugInfo("""
+    file '/Users/barry/.build/amiga/FSUAE-Diag': 6 segments
+      segment #00: CODE [000021c8]    0 symbols,   0 src files
+      segment #01: DATA [00000034]    0 symbols,   0 src files
+      segment #05: BSS  [0000101c]    0 symbols,   0 src files
+    """)
+    #expect(bare.symbols == 0)
+    #expect(bare.sourceFiles == 0)
+
+    let withInfo = server.countDebugInfo("""
+    file '/Users/barry/spinner': 2 segments
+      segment #00: CODE [000021c8]  123 symbols,   4 src files
+      segment #01: DATA [00000034]   17 symbols,   1 src files
+    """)
+    #expect(withInfo.symbols == 140)
+    #expect(withInfo.sourceFiles == 5)
+}
