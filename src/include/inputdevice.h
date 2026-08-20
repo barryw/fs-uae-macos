@@ -347,6 +347,10 @@ extern int jsem_iskbdjoy (int port, const struct uae_prefs *p);
 extern int inputdevice_uaelib (const TCHAR *, const TCHAR *);
 extern int inputdevice_uaelib(const TCHAR *s, int parm, int max, bool autofire);
 
+/* Runs an event string: "kbr <keys>", "evt <event> <value>", "dbg <command>",
+ * or any config option as key=value. Used by the debugger's "I" command. */
+extern int handle_custom_event (const TCHAR *custom);
+
 extern int inputdevice_testread (int*, int*, int*, bool);
 extern int inputdevice_istest (void);
 extern void inputdevice_settest (int);

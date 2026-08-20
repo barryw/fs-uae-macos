@@ -3345,7 +3345,8 @@ struct delayed_event
 };
 static struct delayed_event *delayed_events;
 
-static int handle_custom_event (const TCHAR *custom)
+/* Not static: the debugger's "I" command feeds event strings through here. */
+int handle_custom_event (const TCHAR *custom)
 {
 	TCHAR *p, *buf, *nextp;
 	bool noquot = false;

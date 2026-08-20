@@ -392,27 +392,27 @@ static const char *get_seg_type_str(uae_u32 seg_type)
 
 void debug_info_dump_file(debug_file *file)
 {
-    printf("file '%s': %d segments\n", file->file_name, file->num_segments);
+    console_out_f(_T("file '%s': %d segments\n"), file->file_name, file->num_segments);
     for(int i=0;i<file->num_segments;i++) {
         /* show segment */
         debug_segment *s = &file->segments[i];
-        printf("  segment #%02d: %s [%08x]  %3d symbols, %3d src files\n",
+        console_out_f(_T("  segment #%02d: %s [%08x]  %3d symbols, %3d src files\n"),
             i, get_seg_type_str(s->seg_type), s->size, s->num_symbols, s->num_src_files);
         /* show symbols in segment */
         debug_symbol *sym = s->symbols;
         for(int j=0;j<s->num_symbols;j++) {
-            printf("    %08x  %s\n", sym->offset, sym->name);
+            console_out_f(_T("    %08x  %s\n"), sym->offset, sym->name);
             sym++;
         }
         /* show source files */
         debug_src_file *sf = s->src_files;
         for(int j=0;j<s->num_src_files;j++) {
-            printf("    %s: #%d\n", sf->src_file, sf->num_lines);
+            console_out_f(_T("    %s: #%d\n"), sf->src_file, sf->num_lines);
 
 #if 0
             debug_src_line *sl = sf->lines;
             for(int k=0;k<sf->num_lines;k++) {
-                printf("      @%08x: %5d/%x\n", sl->offset, sl->line, sl->line);
+                console_out_f(_T("      @%08x: %5d/%x\n"), sl->offset, sl->line, sl->line);
                 sl++;
             }
 #endif
@@ -476,40 +476,35 @@ int debug_info_find_src_line(const debug_segment *seg, uae_u32 offset,
         return 0;
     }
 
-    /* search for src_file that contains offset */
-    debug_src_file *file = seg->src_files;
-    while(file != NULL) {
-        debug_src_file *next = file->next;
-        if(next != NULL) {
-            if(offset < next->base_offset) {
-                break;
+    /* Find the line whose offset is the closest one at or below the address.
+     *
+     * Do not assume src_files is ordered by base_offset. parse_debug()
+     * prepends each block as it is read, and an executable linked from many
+     * objects carries several LINE blocks whose bases arrive in no useful
+     * order - so walking the list until the next base exceeds the offset
+     * stops at the wrong block, and usually reports no line at all. Scan
+     * every block instead and keep the best candidate found anywhere.
+     */
+    debug_src_file *best_file = NULL;
+    debug_src_line *best_line = NULL;
+    for(debug_src_file *file = seg->src_files; file != NULL; file = file->next) {
+        debug_src_line *line = file->lines;
+        for(int i = 0; i < file->num_lines; i++, line++) {
+            if(line->offset > offset) {
+                continue;
             }
-        } else {
-            break;
+            if(best_line == NULL || line->offset > best_line->offset) {
+                best_line = line;
+                best_file = file;
+            }
         }
-        file = next;
     }
-    if(file == NULL) {
+    if(best_line == NULL) {
         return 0;
     }
 
-    /* search in src_file for line */
-    debug_src_line *line = file->lines;
-    debug_src_line *last_line = NULL;
-    for(int i=0;i<file->num_lines;i++) {
-        if(line->offset > offset) {
-            if(last_line != NULL) {
-                break;
-            } else {
-                return 0;
-            }
-        }
-        last_line = line;
-        line++;
-    }
-    /* offset beyond last line info */
-    *ret_file = file;
-    *ret_line = last_line;
-    *ret_reloff = offset - last_line->offset;
+    *ret_file = best_file;
+    *ret_line = best_line;
+    *ret_reloff = offset - best_line->offset;
     return 1;
 }

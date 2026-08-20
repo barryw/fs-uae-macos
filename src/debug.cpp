@@ -146,6 +146,7 @@ static TCHAR help[] = {
 	_T("  ot                    Copper single step trace.\n")
 	_T("  ob <addr>             Copper breakpoint.\n")
 	_T("  H[H] <cnt>            Show PC history (HH=full CPU info) <cnt> instructions.\n")
+	_T("  I <custom event>      Send custom event string (kbr/evt/dbg/option=value).\n")
 	_T("  C <value>             Search for values like energy or lifes in games.\n")
 	_T("  Cl                    List currently found trainer addresses.\n")
 	_T("  D[idxzs <[max diff]>] Deep trainer. i=new value must be larger, d=smaller,\n")
@@ -178,7 +179,7 @@ static TCHAR help[] = {
 	_T("  Zl                    show seglists tracked by SegmentTracker.\n")
 	_T("  Za <addr>             find segment that contains given address.\n")
 	_T("  Zs 'name'             search seglist with given name.\n")
-	_T("  Zf 'hostfile'         load debug info from given executable file.\n")
+	_T("  Zf 'name' ['hostfile'] load debug info; hostfile is the HOST path.\n")
 	_T("  Zy 'symbol'           find symbol address.\n")
 	_T("  Zc 'file' <line>      find source code line address.\n")
 #endif /* WITH_SEGTRACKER */
@@ -4632,6 +4633,30 @@ static int parse_string(TCHAR **inptr, TCHAR *str, int max_len)
 	return len;
 }
 
+/* Like parse_string() but keeps case. Seglist names are matched case
+ * insensitively, but a host path has to survive verbatim. */
+static int parse_string_cased(TCHAR **inptr, TCHAR *str, int max_len)
+{
+	int len = 0;
+	ignore_ws (inptr);
+	if ((**inptr == '"')||(**inptr == '\'')) {
+		TCHAR delim = **inptr;
+		(*inptr)++;
+		while (**inptr != delim && **inptr != 0) {
+			str[len++] = **inptr;
+			(*inptr)++;
+			if (len == max_len) {
+				break;
+			}
+		}
+		if (**inptr != 0) {
+			(*inptr)++;
+		}
+	}
+	str[len] = '\0';
+	return len;
+}
+
 /* SegmentTracker Z* command parser */
 static void segtracker(TCHAR **inptr)
 {
@@ -4715,15 +4740,22 @@ static void segtracker(TCHAR **inptr)
 		case 'f': /* 'Zf': load symbols from hunk file */
 			{
 				TCHAR str[256];
+				TCHAR host[256];
 				int len = parse_string(inptr, str, 256);
+				/* Optional second argument: the file to read on the HOST.
+				 * The seglist name is an Amiga path such as
+				 * "SYS:Barry/spinner", which fopen() cannot open, so without
+				 * this the load always failed. */
+				int hostlen = parse_string_cased(inptr, host, 256);
+				const TCHAR *hostfile = hostlen > 0 ? host : str;
 				if(len > 0) {
 					/* find segment */
 					seglist *sl = segtracker_find_by_name(str);
 					if(sl != NULL) {
 						console_out_f(_T("Loading debug info for seglist '%s' from hunk file '%s'\n"),
-									  sl->name, str);
+									  sl->name, hostfile);
 						/* try to load hunk file */
-						debug_file *file = debug_info_load_hunks(str);
+						debug_file *file = debug_info_load_hunks(hostfile);
 						if(file != NULL) {
 							debug_info_dump_file(file);
 							/* try to add debug info to segment */
@@ -4741,7 +4773,7 @@ static void segtracker(TCHAR **inptr)
 						console_out_f(_T("No loaded segment list found for '%s'\n"), str);
 					}
 				} else {
-					console_out_f(_T("No hunk file given!\n"));
+					console_out_f(_T("Usage: Zf 'seglist-name' ['host-file-path']\n"));
 				}
 			}
 			break;
@@ -4836,7 +4868,10 @@ static bool debug_line (TCHAR *input)
 					debug_illegal_mask = debug_illegal ? 0 : -1;
 					debug_illegal_mask &= ~((uae_u64)255 << 24); // mask interrupts
 				}
-				console_out_f (_T("Exception breakpoint mask: %0I64X\n"), debug_illegal_mask);
+				/* %I64X is a Microsoft extension; elsewhere it prints
+				 * literally and hides the mask. Print it as two halves. */
+				console_out_f (_T("Exception breakpoint mask: %08X%08X\n"),
+					(uae_u32)(debug_illegal_mask >> 32), (uae_u32)debug_illegal_mask);
 				debug_illegal = debug_illegal_mask ? 1 : 0;
 			} else {
 				addr = 0xffffffff;
@@ -4859,6 +4894,7 @@ static bool debug_line (TCHAR *input)
 			break;
 		case 'D': deepcheatsearch (&inptr); break;
 		case 'C': cheatsearch (&inptr); break;
+		case 'I': handle_custom_event (inptr); break;
 		case 'W': writeintomem (&inptr); break;
 		case 'w': memwatch (&inptr); break;
 		case 'S': savemem (&inptr); break;

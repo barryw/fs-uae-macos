@@ -748,7 +748,7 @@ int fsuaemac_queue_floppy(int32_t drive, const char *path)
 int fsuaemac_debug_command(const char *command, char *output,
                            uint32_t output_size, uint32_t timeout_ms)
 {
-    if (!command || !output || output_size == 0 || std::strlen(command) >= 100) {
+    if (!command || !output || output_size == 0 || std::strlen(command) >= 1024) {
         set_error("Invalid debugger command");
         return 0;
     }

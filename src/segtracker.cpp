@@ -76,17 +76,17 @@ void segtracker_dump(const char *match)
     seglist *sl = segtracker_pool.first;
     while(sl != NULL) {
         if( (match == NULL) || (strcasestr(sl->name, match)!=NULL) ) {
-            printf("'%s' @%08x\n", sl->name, sl->addr);
+            console_out_f(_T("'%s' @%08x\n"), sl->name, sl->addr);
             segment *s = sl->segments;
             int num = 0;
             while(s->addr != 0) {
-                printf("  #%02d [%08x,%08x,%08x]", num,
+                console_out_f(_T("  #%02d [%08x,%08x,%08x]"), num,
                        s->addr, s->size, s->addr + s->size);
 
                 /* show attached debug info */
                 debug_segment *ds = s->debug;
                 if(ds != NULL) {
-                    printf("  %3d symbols,  %3d src files\n",
+                    console_out_f(_T("  %3d symbols,  %3d src files\n"),
                            ds->num_symbols, ds->num_src_files);
 
                     /* dump symbols */
@@ -94,12 +94,12 @@ void segtracker_dump(const char *match)
                         debug_symbol *symbol = ds->symbols;
                         for(int i=0;i<ds->num_symbols;i++) {
                             uae_u32 addr = s->addr + symbol->offset;
-                            printf("    %08x  %s\n", addr, symbol->name);
+                            console_out_f(_T("    %08x  %s\n"), addr, symbol->name);
                             symbol++;
                         }
                     }
                 } else {
-                    printf("\n");
+                    console_out_f(_T("\n"));
                 }
 
                 s++;
@@ -109,7 +109,7 @@ void segtracker_dump(const char *match)
         }
         sl = sl->next;
     }
-    printf("found %d seglists.\n", sl_num);
+    console_out_f(_T("found %d seglists.\n"), sl_num);
 }
 
 /* search a segment by address */
@@ -300,7 +300,7 @@ static uae_u32 REGPARAM2 LoadSeg(TrapContext *ctx)
     uaecptr seglist_addr = seglist_baddr << 2;
 
     const char *name = (char *)get_real_address(name_addr);
-    //printf("LoadSeg(%s) -> %08x\n",name, seglist_addr);
+    //console_out_f(_T("LoadSeg(%s) -> %08x\n"),name, seglist_addr);
     add_seglist(name, seglist_addr);
 
     return 0;
@@ -314,7 +314,7 @@ static uae_u32 REGPARAM2 NewLoadSeg(TrapContext *ctx)
     uaecptr seglist_addr = seglist_baddr << 2;
 
     const char *name = (char *)get_real_address(name_addr);
-    //printf("NewLoadSeg(%s) -> %08x\n",name, seglist_addr);
+    //console_out_f(_T("NewLoadSeg(%s) -> %08x\n"),name, seglist_addr);
     add_seglist(name, seglist_addr);
 
     return 0;
@@ -326,7 +326,7 @@ static uae_u32 REGPARAM2 UnLoadSeg(TrapContext *ctx)
     uaecptr seglist_baddr = m68k_dreg(regs,1); // d1 = seglist
     uaecptr seglist_addr = seglist_baddr << 2;
 
-    //printf("UnLoadSeg(%08x)\n", seglist_addr);
+    //console_out_f(_T("UnLoadSeg(%08x)\n"), seglist_addr);
     rem_seglist(seglist_addr);
 
     return 0;
@@ -485,14 +485,14 @@ void segtracker_dump_symbols(const char *name)
                         if(strcasestr(ds->name, name)!=NULL) {
                             if(!showed_seglist) {
                                 showed_seglist = 1;
-                                printf("'%s'\n", sl->name);
+                                console_out_f(_T("'%s'\n"), sl->name);
                             }
                             if(!showed_segment) {
                                 showed_segment = 1;
-                                printf("  #%02d\n", i);
+                                console_out_f(_T("  #%02d\n"), i);
                             }
                             uae_u32 addr = ds->offset + s->addr;
-                            printf("    %08x:  %s\n", addr, ds->name);
+                            console_out_f(_T("    %08x:  %s\n"), addr, ds->name);
                         }
                         ds++;
                     }
@@ -531,14 +531,14 @@ void segtracker_dump_src_lines(const char *name, int line)
                                 if(l->line == line) {
                                     if(!showed_seglist) {
                                         showed_seglist = 1;
-                                        printf("'%s'\n", sl->name);
+                                        console_out_f(_T("'%s'\n"), sl->name);
                                     }
                                     if(!showed_segment) {
                                         showed_segment = 1;
-                                        printf("  #%02d\n", i);
+                                        console_out_f(_T("  #%02d\n"), i);
                                     }
                                     uae_u32 addr = l->offset + seg->addr;
-                                    printf("    %08x:  %s:%d\n", addr, sf->src_file, l->line);
+                                    console_out_f(_T("    %08x:  %s:%d\n"), addr, sf->src_file, l->line);
                                 }
                                 l++;
                             }
