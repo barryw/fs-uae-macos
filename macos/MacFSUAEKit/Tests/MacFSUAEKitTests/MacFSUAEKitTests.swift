@@ -156,7 +156,7 @@ import Testing
     let listedTools = try await request("tools/list")
     let toolsResult = try #require(listedTools["result"] as? [String: Any])
     let tools = try #require(toolsResult["tools"] as? [[String: Any]])
-    #expect(tools.count == 22)
+    #expect(tools.count == 26)
     let start = try #require(tools.first { $0["name"] as? String == "fsuae_machine_start" })
     let startSchema = try #require(start["inputSchema"] as? [String: Any])
     let startProperties = try #require(startSchema["properties"] as? [String: Any])
@@ -203,4 +203,97 @@ import Testing
     #expect(frame.sequence == 42)
     #expect(frame.pixels == pixels)
     #expect(reader.latest(after: 42)?.sequence == nil)
+}
+
+/// Exact console text the segment tracker emits, so a change to either the
+/// debugger's format or the parsers shows up here rather than as an empty
+/// Guru report.
+@MainActor
+private func segtrackerParser() -> MacFSUAEMCPServer {
+    MacFSUAEMCPServer(defaults: UserDefaults(suiteName: "fsuae-parse-\(UUID().uuidString)")!,
+                      library: FSUAEConfigurationLibrary(
+                          directory: FileManager.default.temporaryDirectory
+                              .appendingPathComponent(UUID().uuidString, isDirectory: true)),
+                      session: MacFSUAEEngineSession(),
+                      startAutomatically: false)
+}
+
+@MainActor
+@Test func parsesSeglistListing() {
+    let output = """
+    > Zl
+    'SYS:Barry/spinner' @0021a000
+      #00 [0021a004,00004000,0021e004]  123 symbols,    4 src files
+      #01 [00220004,00001000,00221004]
+    'dh0:c/list' @00300000
+      #00 [00300004,00000800,00300804]
+    found 2 seglists.
+    """
+    let seglists = segtrackerParser().parseSeglists(output)
+    #expect(seglists.count == 2)
+    #expect(seglists[0]["name"] as? String == "SYS:Barry/spinner")
+    #expect(seglists[0]["address"] as? String == "0x0021a000")
+    let segments = seglists[0]["segments"] as? [[String: Any]]
+    #expect(segments?.count == 2)
+    #expect(segments?[0]["start"] as? String == "0x0021a004")
+    #expect(segments?[0]["size"] as? Int == 0x4000)
+    #expect(segments?[0]["end"] as? String == "0x0021e004")
+    #expect(segments?[0]["symbols"] as? Int == 123)
+    #expect(segments?[0]["source_files"] as? Int == 4)
+    // The second segment carries no debug info, so it reports no counts.
+    #expect(segments?[1]["symbols"] == nil)
+    #expect(seglists[1]["name"] as? String == "dh0:c/list")
+}
+
+@MainActor
+@Test func parsesAddressLookupWithSymbolAndSourceLine() {
+    let output = """
+    > Za 21ab34
+    0021ab34: 'SYS:Barry/spinner' #00 [0021a004,00004000,0021e004] +00001b30
+        0021aa00 +00000134  _main
+        0021ab20 +00000014  spinner.c:142
+    """
+    let found = segtrackerParser().parseAddressLookup(output)
+    #expect(found["found"] as? Bool == true)
+    #expect(found["seglist"] as? String == "SYS:Barry/spinner")
+    #expect(found["segment_offset"] as? String == "0x00001b30")
+    #expect(found["symbol"] as? String == "_main")
+    #expect(found["symbol_address"] as? String == "0x0021aa00")
+    #expect(found["symbol_offset"] as? String == "0x00000134")
+    #expect(found["source_file"] as? String == "spinner.c")
+    #expect(found["source_line"] as? Int == 142)
+    #expect(found["source_offset"] as? String == "0x00000014")
+    let segment = found["segment"] as? [String: Any]
+    #expect(segment?["index"] as? Int == 0)
+    #expect(segment?["start"] as? String == "0x0021a004")
+}
+
+@MainActor
+@Test func parsesAddressLookupWithoutDebugInfo() {
+    let server = segtrackerParser()
+    // A tracked seglist with no symbols attached yet: header only.
+    let bare = server.parseAddressLookup("""
+    > Za 21ab34
+    0021ab34: 'SYS:Barry/spinner' #00 [0021a004,00004000,0021e004] +00001b30
+    """)
+    #expect(bare["found"] as? Bool == true)
+    #expect(bare["symbol"] == nil)
+    #expect(bare["source_file"] == nil)
+
+    let missing = server.parseAddressLookup("""
+    > Za 7c0f10
+    007c0f10: not found in any segments.
+    """)
+    #expect(missing["found"] as? Bool == false)
+}
+
+@MainActor
+@Test func parsesHexAddressesLeniently() {
+    let server = segtrackerParser()
+    #expect(server.parseHex("0021ab34") == 0x0021ab34)
+    #expect(server.parseHex("0x21AB34") == 0x21ab34)
+    #expect(server.parseHex(" 21ab34 ") == 0x21ab34)
+    #expect(server.parseHex("") == nil)
+    #expect(server.parseHex("nothex") == nil)
+    #expect(server.parseHex("1234567890") == nil)
 }

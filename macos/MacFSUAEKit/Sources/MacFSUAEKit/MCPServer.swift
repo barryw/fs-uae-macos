@@ -642,6 +642,27 @@ public final class MacFSUAEMCPServer: ObservableObject {
             tool("fsuae_debug_snapshot", "Capture CPU registers, recent instruction history, and Exec task state in one debugger-safe operation.",
                  stringSchema(["machine_id": "Running machine UUID"],
                               required: ["machine_id"])),
+            tool("fsuae_debug_tracking", "Turn LoadSeg tracking on or off. Only seglists loaded while it is on can be mapped back to a hunk, symbol and source line, so turn it on and reset before launching the program under test.", [
+                "type": "object",
+                "properties": [
+                    "machine_id": ["type": "string", "description": "Running machine UUID"],
+                    "enabled": ["type": "boolean", "default": true],
+                ],
+                "required": ["machine_id"], "additionalProperties": false,
+            ]),
+            tool("fsuae_debug_segments", "List the seglists the segment tracker has recorded, with each segment's address range and how much debug info is attached to it.",
+                 stringSchema(["machine_id": "Running machine UUID",
+                               "match": "Optional case-insensitive substring of the seglist name"],
+                              required: ["machine_id"])),
+            tool("fsuae_debug_symbols", "Attach symbols and source lines to a tracked seglist by reading hunk debug info from the same executable's file on this Mac.",
+                 stringSchema(["machine_id": "Running machine UUID",
+                               "seglist": "Seglist name exactly as fsuae_debug_segments reports it, for example SYS:Barry/spinner",
+                               "host_path": "Path on this Mac to the same executable, linked with debug hunks"],
+                              required: ["machine_id", "seglist", "host_path"])),
+            tool("fsuae_debug_resolve", "Map an Amiga address onto its seglist, segment, nearest symbol and source line. Run it on the faulting PC from fsuae_machine_diagnostics to turn a Guru into a file and line.",
+                 stringSchema(["machine_id": "Running machine UUID",
+                               "address": "Amiga address in hex, with or without a 0x prefix"],
+                              required: ["machine_id", "address"])),
             tool("fsuae_file_put", "Write a base64-encoded file to any AmigaDOS path through the guest service.",
                  stringSchema(["machine_id": "Running machine UUID",
                                "path": "Destination AmigaDOS path",
@@ -733,6 +754,14 @@ public final class MacFSUAEMCPServer: ObservableObject {
             return try await debuggerExecute(arguments, snapshot: false)
         case "fsuae_debug_snapshot":
             return try await debuggerExecute(arguments, snapshot: true)
+        case "fsuae_debug_tracking":
+            return try await debugTracking(arguments)
+        case "fsuae_debug_segments":
+            return try await debugSegments(arguments)
+        case "fsuae_debug_symbols":
+            return try await debugSymbols(arguments)
+        case "fsuae_debug_resolve":
+            return try await debugResolve(arguments)
         case "fsuae_file_put":
             return try await guestFilePut(arguments)
         case "fsuae_file_get":
@@ -1255,6 +1284,15 @@ public final class MacFSUAEMCPServer: ObservableObject {
         if let data = debugger.data(using: .utf8),
            let object = try? JSONSerialization.jsonObject(with: data) {
             result["debugger"] = object
+        }
+        // A Guru is only actionable once the faulting PC has a name, so resolve
+        // it here rather than making the caller know to ask. Silent when the
+        // segment tracker has nothing covering the address.
+        if var exception = result["cpu_exception"] as? [String: Any],
+           let location = try? await resolveAddress(machineID, machine.exceptionPC),
+           location["found"] as? Bool == true {
+            exception["location"] = location
+            result["cpu_exception"] = exception
         }
         return try jsonText(result)
     }
@@ -1820,8 +1858,9 @@ public final class MacFSUAEMCPServer: ObservableObject {
         return try jsonText(result)
     }
 
-    private func debuggerExecute(_ arguments: [String: Any], snapshot: Bool) async throws -> String {
-        let machineID = try requiredString("machine_id", in: arguments)
+    /// Runs debugger commands on the emulator thread and returns raw console output.
+    private func runDebugger(_ machineID: String,
+                             _ commands: [String]) async throws -> (succeeded: Bool, output: String) {
         guard workerProcesses[machineID]?.isRunning == true,
               workerExchangePaths[machineID] != nil else {
             throw MCPFailure("No running machine \(machineID)")
@@ -1830,17 +1869,6 @@ public final class MacFSUAEMCPServer: ObservableObject {
             throw MCPFailure("Machine \(machineID) already has a debugger command running")
         }
         defer { debuggerMachines.remove(machineID) }
-        let commands: [String]
-        if snapshot {
-            commands = ["r", "H 32", "T"]
-        } else {
-            let command = try requiredString("command", in: arguments)
-            guard let data = command.data(using: .isoLatin1), !data.contains(0),
-                  data.count < 100 else {
-                throw MCPFailure("Debugger command must be Latin-1 text under 100 bytes")
-            }
-            commands = [command]
-        }
         let request = UUID().uuidString.lowercased()
         let resultURL = try exchangeURL(machineID: machineID,
                                         name: "FSUAE-Debug-\(request)")
@@ -1853,13 +1881,247 @@ public final class MacFSUAEMCPServer: ObservableObject {
         repeat {
             if let data = try? Data(contentsOf: resultURL),
                let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                return try jsonText(["machine_id": machineID, "commands": commands,
-                                     "succeeded": result["succeeded"] as? Bool ?? false,
-                                     "output": result["output"] as? String ?? ""])
+                return (result["succeeded"] as? Bool ?? false,
+                        result["output"] as? String ?? "")
             }
             try await Task.sleep(for: .milliseconds(20))
         } while ContinuousClock.now < deadline
         throw MCPFailure("Debugger command timed out on machine \(machineID)")
+    }
+
+    /// The debugger reads one Latin-1 line; libfsuaemac rejects 1024 bytes or more.
+    private func debuggerLine(_ command: String) throws -> String {
+        guard let data = command.data(using: .isoLatin1), !data.contains(0),
+              data.count < 1024 else {
+            throw MCPFailure("Debugger command must be Latin-1 text under 1024 bytes")
+        }
+        return command
+    }
+
+    private func debuggerExecute(_ arguments: [String: Any], snapshot: Bool) async throws -> String {
+        let machineID = try requiredString("machine_id", in: arguments)
+        let commands = snapshot
+            ? ["r", "H 32", "T"]
+            : [try debuggerLine(try requiredString("command", in: arguments))]
+        let result = try await runDebugger(machineID, commands)
+        return try jsonText(["machine_id": machineID, "commands": commands,
+                             "succeeded": result.succeeded, "output": result.output])
+    }
+
+    // MARK: - Segment tracker
+    //
+    // The tracker patches LoadSeg so every seglist the guest loads is recorded
+    // with its real load address. Point it at the host-side executable and a
+    // crash address becomes a symbol and a source line. The debugger reports
+    // all of this as text, so these tools parse its fixed formats back into
+    // JSON rather than making the caller read console output.
+
+    private func debugTracking(_ arguments: [String: Any]) async throws -> String {
+        let machineID = try requiredString("machine_id", in: arguments)
+        let enabled = arguments["enabled"] as? Bool ?? true
+        let result = try await runDebugger(machineID, ["Ze \(enabled ? 1 : 0)"])
+        return try jsonText([
+            "machine_id": machineID,
+            "enabled": enabled,
+            "succeeded": result.succeeded,
+            "output": result.output,
+            "note": enabled
+                ? "Only seglists loaded from now on are tracked. Reset the machine before launching the program under test, or nothing will be recorded."
+                : "Tracking is off and the seglists recorded so far have been discarded.",
+        ])
+    }
+
+    private func debugSegments(_ arguments: [String: Any]) async throws -> String {
+        let machineID = try requiredString("machine_id", in: arguments)
+        let match = optionalString("match", in: arguments)
+        // Z reports whether tracking is on, which is the answer whenever the
+        // list comes back empty. Zl lists the seglists; Zs would filter, but it
+        // also dumps every symbol of every match, so filter here instead.
+        let result = try await runDebugger(machineID, ["Z", "Zl"])
+        let tracking = result.output.contains("SegmentTracker is enabled")
+        var seglists = parseSeglists(result.output)
+        if let match {
+            seglists = seglists.filter {
+                ($0["name"] as? String ?? "").localizedCaseInsensitiveContains(match)
+            }
+        }
+        var payload: [String: Any] = ["machine_id": machineID, "tracking": tracking,
+                                      "seglists": seglists]
+        if !tracking {
+            payload["note"] = "Segment tracking is off. Enable it with fsuae_debug_tracking, then reset before launching the program under test."
+        }
+        return try jsonText(payload)
+    }
+
+    private func debugSymbols(_ arguments: [String: Any]) async throws -> String {
+        let machineID = try requiredString("machine_id", in: arguments)
+        let seglist = try requiredString("seglist", in: arguments)
+        let hostPath = try requiredString("host_path", in: arguments)
+        guard FileManager.default.fileExists(atPath: hostPath) else {
+            throw MCPFailure("No file at \(hostPath)")
+        }
+        // Zf takes quoted arguments and gives no way to escape a quote, so a
+        // path containing one cannot be expressed.
+        guard !seglist.contains("'"), !hostPath.contains("'") else {
+            throw MCPFailure("Seglist name and host path must not contain a single quote")
+        }
+        let line = try debuggerLine("Zf '\(seglist)' '\(hostPath)'")
+        let result = try await runDebugger(machineID, [line])
+        // Zf reports failure in prose, so read the outcome from the text.
+        let loaded = result.succeeded && result.output.contains("segments")
+            && !result.output.contains("Cannot load")
+        return try jsonText(["machine_id": machineID, "seglist": seglist,
+                             "host_path": hostPath, "loaded": loaded,
+                             "output": result.output])
+    }
+
+    private func debugResolve(_ arguments: [String: Any]) async throws -> String {
+        let machineID = try requiredString("machine_id", in: arguments)
+        let text = try requiredString("address", in: arguments)
+        guard let address = parseHex(text) else {
+            throw MCPFailure("Address must be hexadecimal, for example 0021ab34 or 0x21ab34")
+        }
+        var payload = try await resolveAddress(machineID, address)
+        payload["machine_id"] = machineID
+        return try jsonText(payload)
+    }
+
+    private func resolveAddress(_ machineID: String, _ address: UInt32) async throws -> [String: Any] {
+        let result = try await runDebugger(machineID, [String(format: "Za %x", address)])
+        var payload = parseAddressLookup(result.output)
+        payload["address"] = String(format: "0x%08x", address)
+        if payload["found"] as? Bool != true {
+            payload["output"] = result.output
+        }
+        return payload
+    }
+
+    func parseHex(_ text: String) -> UInt32? {
+        var digits = text.trimmingCharacters(in: .whitespaces).lowercased()
+        if digits.hasPrefix("0x") { digits.removeFirst(2) }
+        guard !digits.isEmpty, digits.count <= 8,
+              digits.allSatisfy({ $0.isHexDigit }) else { return nil }
+        return UInt32(digits, radix: 16)
+    }
+
+    /// Parses `Zl` output: a `'name' @address` line per seglist, then one
+    /// indented `#nn [start,size,end]` line per segment, optionally carrying
+    /// symbol and source-file counts once debug info is attached.
+    func parseSeglists(_ output: String) -> [[String: Any]] {
+        var seglists: [[String: Any]] = []
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            let text = String(line)
+            if text.hasPrefix("'"), let range = text.range(of: "' @") {
+                let name = String(text[text.index(after: text.startIndex)..<range.lowerBound])
+                let address = parseHex(String(text[range.upperBound...])) ?? 0
+                seglists.append(["name": name,
+                                 "address": String(format: "0x%08x", address),
+                                 "segments": [[String: Any]]()])
+            } else if text.hasPrefix("  #"), !seglists.isEmpty,
+                      let segment = parseSegment(text) {
+                var last = seglists.removeLast()
+                var segments = last["segments"] as? [[String: Any]] ?? []
+                segments.append(segment)
+                last["segments"] = segments
+                seglists.append(last)
+            }
+        }
+        return seglists
+    }
+
+    /// `  #00 [0021a004,00004000,0021e004]  123 symbols,    4 src files`
+    func parseSegment(_ text: String) -> [String: Any]? {
+        guard let open = text.firstIndex(of: "["), let close = text.firstIndex(of: "]") else {
+            return nil
+        }
+        let index = Int(text[text.index(text.startIndex, offsetBy: 3)..<open]
+            .trimmingCharacters(in: .whitespaces)) ?? 0
+        let fields = text[text.index(after: open)..<close].split(separator: ",")
+        guard fields.count == 3,
+              let start = parseHex(String(fields[0])),
+              let size = parseHex(String(fields[1])) else { return nil }
+        var segment: [String: Any] = [
+            "index": index,
+            "start": String(format: "0x%08x", start),
+            "size": Int(size),
+            "end": String(format: "0x%08x", start &+ size),
+        ]
+        let tail = String(text[text.index(after: close)...])
+        if let symbols = countBefore("symbols", in: tail) {
+            segment["symbols"] = symbols
+            segment["source_files"] = countBefore("src files", in: tail) ?? 0
+        }
+        return segment
+    }
+
+    func countBefore(_ label: String, in text: String) -> Int? {
+        guard let range = text.range(of: label) else { return nil }
+        return Int(text[..<range.lowerBound].split(separator: " ").last ?? "")
+    }
+
+    /// Parses `Za` output. The header names the seglist and segment; up to two
+    /// indented lines follow, the nearest symbol and then the nearest source
+    /// line, either of which is absent when no debug info covers the address.
+    func parseAddressLookup(_ output: String) -> [String: Any] {
+        var payload: [String: Any] = ["found": false]
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            let text = String(line)
+            if text.contains(": '"), let header = parseLookupHeader(text) {
+                payload = header
+                payload["found"] = true
+            } else if text.hasPrefix("    "), payload["found"] as? Bool == true,
+                      let entry = parseLookupEntry(text) {
+                // A source line ends in ":<line>"; a symbol name does not.
+                if let (file, number) = splitSourceLocation(entry.label) {
+                    payload["source_file"] = file
+                    payload["source_line"] = number
+                    payload["source_address"] = entry.address
+                    payload["source_offset"] = entry.offset
+                } else {
+                    payload["symbol"] = entry.label
+                    payload["symbol_address"] = entry.address
+                    payload["symbol_offset"] = entry.offset
+                }
+            }
+        }
+        return payload
+    }
+
+    /// `0021ab34: 'SYS:Barry/spinner' #00 [0021a004,00004000,0021e004] +00001b30`
+    func parseLookupHeader(_ text: String) -> [String: Any]? {
+        guard let nameStart = text.range(of: ": '"),
+              let nameEnd = text.range(of: "' #", range: nameStart.upperBound..<text.endIndex),
+              let segment = parseSegment("  #" + text[nameEnd.upperBound...]) else {
+            return nil
+        }
+        var payload: [String: Any] = [
+            "seglist": String(text[nameStart.upperBound..<nameEnd.lowerBound]),
+            "segment": segment,
+        ]
+        if let plus = text.range(of: "] +"),
+           let offset = parseHex(String(text[plus.upperBound...])) {
+            payload["segment_offset"] = String(format: "0x%08x", offset)
+        }
+        return payload
+    }
+
+    /// `    0021aa00 +00000134  _main`
+    func parseLookupEntry(_ text: String) -> (address: String, offset: String, label: String)? {
+        let body = text.trimmingCharacters(in: .whitespaces)
+        guard let split = body.range(of: "  ") else { return nil }
+        let head = body[..<split.lowerBound].split(separator: " ")
+        guard head.count == 2, head[1].hasPrefix("+"),
+              let address = parseHex(String(head[0])),
+              let offset = parseHex(String(head[1].dropFirst())) else { return nil }
+        return (String(format: "0x%08x", address),
+                String(format: "0x%08x", offset),
+                String(body[split.upperBound...]).trimmingCharacters(in: .whitespaces))
+    }
+
+    func splitSourceLocation(_ label: String) -> (file: String, line: Int)? {
+        guard let colon = label.lastIndex(of: ":"),
+              let number = Int(label[label.index(after: colon)...]) else { return nil }
+        return (String(label[..<colon]), number)
     }
 
     private func exchangeName(in arguments: [String: Any]) throws -> String {
