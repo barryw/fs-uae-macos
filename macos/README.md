@@ -33,12 +33,37 @@ test does not depend on `C:`, `RAM:`, Workbench commands, or the CPU model:
 
 ```sh
 ./macos/scripts/build-amiga-tools.sh
-./macos/scripts/stress-test-mcp.py A500
-./macos/scripts/stress-test-mcp.py A1200
-./macos/scripts/stress-test-mcp.py A4000
+./macos/scripts/stress-test-mcp.sh A500
+./macos/scripts/stress-test-mcp.sh A1200
+./macos/scripts/stress-test-mcp.sh A4000
 ```
 
 Each run verifies commands, exact output, binary file transfer, stale-response
 rejection, timeout/reset recovery, and repeated process lifecycles. The guest
 service requires a bootable Exec/AmigaDOS environment; configurations with
 missing or uninstalled OS media cannot provide guest control.
+
+## Debugging a Guru
+
+The emulator records every CPU exception through `uae_cpu_exception_hook`
+without stopping, so `fsuae_machine_diagnostics` reports the vector, the
+faulting instruction's PC, the fault address and the task at any time. Nothing
+has to be armed first, and nothing halts the machine - `libfsuaemac` has no
+console for the built-in debugger to read from, so `console_get()` reports
+end-of-input rather than hanging the emulator thread.
+
+To get from an address to a source line, the segment tracker has to be
+watching when the program is loaded:
+
+1. `fsuae_debug_tracking` with `enabled: true`.
+2. Reset, then launch the program. Only seglists loaded after tracking is on
+   are recorded.
+3. `fsuae_debug_segments` to see the seglist name and its load addresses.
+4. `fsuae_debug_symbols` with that name and the host path of the same
+   executable, linked with debug hunks.
+5. `fsuae_debug_resolve` on any address - or just read
+   `cpu_exception.location` from `fsuae_machine_diagnostics`, which resolves
+   the faulting PC for you.
+
+`fsuae_debug_command` still takes any built-in debugger command for anything
+these do not cover.
