@@ -28,6 +28,17 @@ import Testing
         MacFSUAEGuestStatus(succeeded: false, exitCode: -5))
 }
 
+@Test func parsesDebuggerBreakpointList() {
+    #expect(parseDebuggerBreakpoints("> fl\n  0021AB34  00C01234 \n") == [0x0021_ab34, 0x00c0_1234])
+    #expect(parseDebuggerBreakpoints("> fl\nNo breakpoints\n").isEmpty)
+}
+
+@Test func validatesSnapshotLabels() {
+    #expect(snapshotLabel(" Work/Bench: 1 ") == "Work-Bench- 1")
+    #expect(snapshotLabel("\n\t") == nil)
+    #expect(snapshotLabel(String(repeating: "x", count: 81)) == nil)
+}
+
 @Test func driveStatusUpdatesMediaAndAggregateHardDiskActivity() {
     var drives: [MacFSUAEDrive] = []
     drives = updatingDriveStatuses(drives, with: MacFSUAEDrive(
@@ -74,6 +85,18 @@ import Testing
     #expect(configuration.value(for: "hard_drive_0") == "/Games/System.hdf")
     #expect(configuration.text.contains("uae_magic_option = keep-me"))
     #expect(configuration.text.contains("# launcher comment"))
+}
+
+@Test func hostIntegrationIsExplicitAndConfigurable() {
+    var configuration = FSUAEConfiguration(
+        url: URL(fileURLWithPath: "/tmp/Integration.fs-uae"),
+        text: "[fs-uae]\namiga_model = A500\n")
+
+    #expect(!configuration.hostIntegrationEnabled)
+    configuration.setValue("1", for: "host_integration")
+    #expect(configuration.hostIntegrationEnabled)
+    configuration.setValue("0", for: "host_integration")
+    #expect(!configuration.hostIntegrationEnabled)
 }
 
 @MainActor

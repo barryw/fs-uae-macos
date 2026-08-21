@@ -29,6 +29,8 @@ int MacFSUAEEngineQueueMousePosition(int32_t x, int32_t y);
 int MacFSUAEEngineQueueMouseButton(uint32_t button, int32_t pressed);
 int MacFSUAEEngineDebugCommand(const char *command, char *output,
                                uint32_t outputSize, uint32_t timeoutMilliseconds);
+int MacFSUAEEngineSnapshot(const char *path, int32_t restore,
+                           uint32_t timeoutMilliseconds);
 int MacFSUAEEngineSetSpeed(double multiplier);
 int MacFSUAEEngineQueuePause(int32_t paused);
 int MacFSUAEEngineQueueReset(int32_t hard);

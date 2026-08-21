@@ -64,6 +64,7 @@ typedef struct fsuaemac_health {
     uint32_t exception_pc;
     uint32_t exception_address;
     uint32_t exception_task;
+    uint32_t debugger_stopped;
     char exception_task_name[64];
 } fsuaemac_health;
 
@@ -96,6 +97,8 @@ FSUAE_MAC_API int fsuaemac_queue_mouse_position(int32_t x, int32_t y);
 FSUAE_MAC_API int fsuaemac_queue_mouse_button(uint32_t button, int32_t pressed);
 FSUAE_MAC_API int fsuaemac_debug_command(const char *command, char *output,
                                          uint32_t output_size, uint32_t timeout_ms);
+FSUAE_MAC_API int fsuaemac_snapshot(const char *path, int32_t restore,
+                                    uint32_t timeout_ms);
 FSUAE_MAC_API int fsuaemac_set_speed(double multiplier);
 FSUAE_MAC_API int fsuaemac_queue_pause(int32_t paused);
 FSUAE_MAC_API int fsuaemac_queue_reset(int32_t hard);

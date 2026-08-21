@@ -1,4 +1,5 @@
 import AppKit
+import AppKit
 import Combine
 import Darwin
 import Foundation
@@ -30,6 +31,7 @@ public struct MacFSUAERunningMachine: Identifiable, Equatable, Sendable {
     public fileprivate(set) var exceptionPC: UInt32 = 0
     public fileprivate(set) var exceptionAddress: UInt32 = 0
     public fileprivate(set) var exceptionTask: UInt32 = 0
+    public fileprivate(set) var debuggerStopped = false
     public fileprivate(set) var exceptionTaskName = ""
 }
 
@@ -55,6 +57,28 @@ func parseGuestStatus(_ data: Data, token: UInt32) -> MacFSUAEGuestStatus? {
         nil
     }
     return MacFSUAEGuestStatus(succeeded: data[0] == 0x31, exitCode: exitCode)
+}
+
+func parseDebuggerBreakpoints(_ output: String) -> [UInt32] {
+    Array(Set(output.split(whereSeparator: { $0.isWhitespace }).compactMap { token in
+        guard token.count == 8, token.allSatisfy(\.isHexDigit) else { return nil }
+        return UInt32(token, radix: 16)
+    })).sorted()
+}
+
+public func snapshotLabel(_ name: String) -> String? {
+    let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty, trimmed.count <= 80 else { return nil }
+    let forbidden = CharacterSet.controlCharacters.union(CharacterSet(charactersIn: "/:"))
+    return trimmed.components(separatedBy: forbidden).joined(separator: "-")
+}
+
+public struct MacFSUAESnapshot: Identifiable, Hashable {
+    public let id: String
+    public let name: String
+    public let configuration: String
+    public let created: Date
+    public let size: Int
 }
 
 private final class MCPHTTPServer: @unchecked Sendable {
@@ -228,11 +252,18 @@ public final class MacFSUAEMCPServer: ObservableObject {
     private var workerFrameSources: [String: MacFSUAEFrameSource] = [:]
     private var workerFramePaths: [String: String] = [:]
     private var workerExchangePaths: [String: String] = [:]
+    private var workerControlPaths: [String: String] = [:]
+    private var workerLaunches: [String: WorkerLaunch] = [:]
     private enum GuestOperation { case command, put, get }
     private struct HDFOverride {
         let drive: Int
         let path: String
         let readOnly: Bool
+    }
+    private struct WorkerLaunch {
+        let presentation: String
+        let floppies: [String]?
+        let hdfs: [HDFOverride]
     }
     private struct GuestRequest {
         let machineID: String
@@ -254,6 +285,7 @@ public final class MacFSUAEMCPServer: ObservableObject {
     private var workerResetGenerationBaselines: [String: UInt32] = [:]
     private var workerAlertBaselines: [String: [UInt32]] = [:]
     private var debuggerMachines: Set<String> = []
+    private var snapshotMachines: Set<String> = []
     private var foregroundMachineID: String?
     private var foregroundAlertBaseline: [UInt32]?
     private var selectedPresentedMachineID: String?
@@ -352,6 +384,16 @@ public final class MacFSUAEMCPServer: ObservableObject {
         _ = try stopWorker(machineID)
     }
 
+    public func restart(_ machineID: String,
+                        configuration: FSUAEConfiguration) async throws -> MacFSUAERunningMachine {
+        guard let launch = workerLaunches[machineID] else {
+            throw MCPFailure("No running machine \(machineID)")
+        }
+        _ = try await stopWorkerAndWait(machineID)
+        return try startWorker(configuration, presentation: launch.presentation,
+                               floppies: launch.floppies, hdfs: launch.hdfs)
+    }
+
     public func frameSource(for machineID: String) -> MacFSUAEFrameSource? {
         workerFrameSources[machineID]
     }
@@ -394,6 +436,51 @@ public final class MacFSUAEMCPServer: ObservableObject {
 
     public func reset(_ machineID: String, hard: Bool = false) {
         _ = sendWorkerCommand(machineID, ["command": "reset", "hard": hard])
+    }
+
+    public func snapshots(configuration: String) -> [MacFSUAESnapshot] {
+        guard let directory = try? snapshotDirectory(configuration: configuration),
+              let urls = try? FileManager.default.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: [.creationDateKey,
+                                                             .contentModificationDateKey,
+                                                             .fileSizeKey]) else { return [] }
+        return urls.compactMap { snapshot(at: $0, configuration: configuration) }
+            .sorted { $0.created > $1.created }
+    }
+
+    @discardableResult
+    public func saveSnapshot(machineID: String, name: String) async throws -> MacFSUAESnapshot {
+        guard let machine = runningMachines.first(where: { $0.id == machineID }) else {
+            throw MCPFailure("No running machine \(machineID)")
+        }
+        guard let label = snapshotLabel(name) else {
+            throw MCPFailure("Snapshot name must contain 1 to 80 characters")
+        }
+        let directory = try snapshotDirectory(configuration: machine.configuration)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let stamp = ISO8601DateFormatter().string(from: Date())
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: ":", with: "")
+        let token = UUID().uuidString.prefix(8).lowercased()
+        let url = directory.appendingPathComponent("\(stamp)-\(token)--\(label).uss")
+        try await runSnapshot(machineID, action: "save", url: url)
+        guard let value = snapshot(at: url, configuration: machine.configuration) else {
+            throw MCPFailure("Snapshot file was not created")
+        }
+        return value
+    }
+
+    public func restoreSnapshot(machineID: String, snapshotID: String) async throws {
+        guard let machine = runningMachines.first(where: { $0.id == machineID }) else {
+            throw MCPFailure("No running machine \(machineID)")
+        }
+        let url = try snapshotURL(snapshotID, configuration: machine.configuration)
+        try await runSnapshot(machineID, action: "restore", url: url)
+    }
+
+    public func deleteSnapshot(configuration: String, snapshotID: String) throws {
+        try FileManager.default.removeItem(at: snapshotURL(snapshotID,
+                                                            configuration: configuration))
     }
 
     public func setSpeed(_ speed: Double, for machineID: String) {
@@ -642,6 +729,65 @@ public final class MacFSUAEMCPServer: ObservableObject {
             tool("fsuae_debug_snapshot", "Capture CPU registers, recent instruction history, and Exec task state in one debugger-safe operation.",
                  stringSchema(["machine_id": "Running machine UUID"],
                               required: ["machine_id"])),
+            tool("fsuae_debug_breakpoints", "Set, remove, list, or clear instruction breakpoints without toggle ambiguity.", [
+                "type": "object",
+                "properties": [
+                    "machine_id": ["type": "string", "description": "Running machine UUID"],
+                    "action": ["type": "string", "enum": ["set", "remove", "list", "clear"]],
+                    "address": ["type": "string",
+                                "description": "Hex address required by set and remove"],
+                ],
+                "required": ["machine_id", "action"], "additionalProperties": false,
+            ]),
+            tool("fsuae_debug_execution", "Continue, single-step, or step over code in a debugger-stopped machine.", [
+                "type": "object",
+                "properties": [
+                    "machine_id": ["type": "string", "description": "Running machine UUID"],
+                    "action": ["type": "string", "enum": ["continue", "step", "step_over"]],
+                    "instructions": ["type": "integer", "minimum": 1, "maximum": 10000,
+                                     "default": 1],
+                ],
+                "required": ["machine_id", "action"], "additionalProperties": false,
+            ]),
+            tool("fsuae_debug_wait", "Wait for a breakpoint, step, or exception to stop the emulator, then return a debugger snapshot and source location.", [
+                "type": "object",
+                "properties": [
+                    "machine_id": ["type": "string", "description": "Running machine UUID"],
+                    "timeout_seconds": ["type": "integer", "minimum": 1, "maximum": 300,
+                                        "default": 30],
+                ],
+                "required": ["machine_id"], "additionalProperties": false,
+            ]),
+            tool("fsuae_machine_inspect", "Inspect host-side CPU, history, tasks, chipset, Copper, or memory state without the guest service.", [
+                "type": "object",
+                "properties": [
+                    "machine_id": ["type": "string", "description": "Running machine UUID"],
+                    "domains": ["type": "array", "uniqueItems": true,
+                                "items": ["type": "string",
+                                          "enum": ["cpu", "history", "tasks", "hardware",
+                                                   "custom", "copper", "memory", "performance"]]],
+                    "address": ["type": "string",
+                                "description": "Hex start address for memory; defaults to PC"],
+                    "lines": ["type": "integer", "minimum": 1, "maximum": 256,
+                              "default": 16],
+                ],
+                "required": ["machine_id"], "additionalProperties": false,
+            ]),
+            tool("fsuae_snapshot_save", "Save a named snapshot of a running machine to a new .uss state file.",
+                 stringSchema(["machine_id": "Running machine UUID",
+                               "name": "Snapshot name (1 to 80 characters)"],
+                              required: ["machine_id", "name"])),
+            tool("fsuae_snapshots_list", "List all saved snapshots for a configuration.",
+                 stringSchema(["configuration": "Configuration name"],
+                              required: ["configuration"])),
+            tool("fsuae_snapshot_restore", "Restore a saved snapshot into its running machine. Current unsaved machine state is replaced.",
+                 stringSchema(["machine_id": "Running machine UUID",
+                               "snapshot_id": "Snapshot id returned by fsuae_snapshots_list"],
+                              required: ["machine_id", "snapshot_id"])),
+            tool("fsuae_snapshot_delete", "Permanently delete a saved snapshot.",
+                 stringSchema(["configuration": "Configuration name",
+                               "snapshot_id": "Snapshot id returned by fsuae_snapshots_list"],
+                              required: ["configuration", "snapshot_id"])),
             tool("fsuae_debug_tracking", "Turn LoadSeg tracking on or off. Only seglists loaded while it is on can be mapped back to a hunk, symbol and source line, so turn it on and reset before launching the program under test.", [
                 "type": "object",
                 "properties": [
@@ -754,6 +900,32 @@ public final class MacFSUAEMCPServer: ObservableObject {
             return try await debuggerExecute(arguments, snapshot: false)
         case "fsuae_debug_snapshot":
             return try await debuggerExecute(arguments, snapshot: true)
+        case "fsuae_debug_breakpoints":
+            return try await debugBreakpoints(arguments)
+        case "fsuae_debug_execution":
+            return try await debugExecution(arguments)
+        case "fsuae_debug_wait":
+            return try await debugWait(arguments)
+        case "fsuae_machine_inspect":
+            return try await machineInspect(arguments)
+        case "fsuae_snapshot_save":
+            let value = try await saveSnapshot(
+                machineID: requiredString("machine_id", in: arguments),
+                name: requiredString("name", in: arguments))
+            return try snapshotJSON(value)
+        case "fsuae_snapshots_list":
+            let values = snapshots(configuration: try requiredString("configuration", in: arguments))
+            return try jsonText(["snapshots": values.map(snapshotDictionary)])
+        case "fsuae_snapshot_restore":
+            try await restoreSnapshot(
+                machineID: requiredString("machine_id", in: arguments),
+                snapshotID: requiredString("snapshot_id", in: arguments))
+            return "Snapshot restored"
+        case "fsuae_snapshot_delete":
+            try deleteSnapshot(
+                configuration: requiredString("configuration", in: arguments),
+                snapshotID: requiredString("snapshot_id", in: arguments))
+            return "Snapshot deleted"
         case "fsuae_debug_tracking":
             return try await debugTracking(arguments)
         case "fsuae_debug_segments":
@@ -804,8 +976,18 @@ public final class MacFSUAEMCPServer: ObservableObject {
         process.executableURL = executable
         process.arguments = [configuration.url.path]
         var environment = ProcessInfo.processInfo.environment
+        let controlPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fsuae-\(id)-control", isDirectory: true).path
+        do {
+            try FileManager.default.createDirectory(atPath: controlPath,
+                                                    withIntermediateDirectories: false,
+                                                    attributes: [.posixPermissions: 0o700])
+        } catch {
+            throw MCPFailure("Could not create the debugger control directory")
+        }
+        environment["FSUAE_MAC_CONTROL_DIRECTORY"] = controlPath
         var exchangePath: String?
-        if isEnabled {
+        if configuration.hostIntegrationEnabled {
             let path = FileManager.default.temporaryDirectory
                 .appendingPathComponent("fsuae-\(id)-exchange", isDirectory: true).path
             do {
@@ -822,6 +1004,7 @@ public final class MacFSUAEMCPServer: ObservableObject {
                 }
             } catch {
                 try? FileManager.default.removeItem(atPath: path)
+                try? FileManager.default.removeItem(atPath: controlPath)
                 throw MCPFailure("Could not create the MCP: exchange volume")
             }
             exchangePath = path
@@ -830,6 +1013,7 @@ public final class MacFSUAEMCPServer: ObservableObject {
         let framePath = FileManager.default.temporaryDirectory
             .appendingPathComponent("fsuae-\(id).frame").path
         guard let transport = MacFSUAEFrameTransport(creating: framePath) else {
+            try? FileManager.default.removeItem(atPath: controlPath)
             throw MCPFailure("Could not create the display channel")
         }
         environment["FSUAE_MAC_FRAME_FILE"] = framePath
@@ -873,6 +1057,7 @@ public final class MacFSUAEMCPServer: ObservableObject {
         } catch {
             try? FileManager.default.removeItem(atPath: framePath)
             if let exchangePath { try? FileManager.default.removeItem(atPath: exchangePath) }
+            try? FileManager.default.removeItem(atPath: controlPath)
             throw MCPFailure("Could not start FS-UAE Worker: \(error.localizedDescription)")
         }
         guard process.isRunning else {
@@ -889,6 +1074,9 @@ public final class MacFSUAEMCPServer: ObservableObject {
         workerTransports[id] = transport
         workerFrameSources[id] = MacFSUAEFrameSource(transport: transport)
         workerFramePaths[id] = framePath
+        workerControlPaths[id] = controlPath
+        workerLaunches[id] = WorkerLaunch(presentation: presentation,
+                                          floppies: floppies, hdfs: hdfs)
         workerOutputBuffers[id] = ""
         workerHealthDates[id] = Date()
         runningMachines.append(machine)
@@ -1005,6 +1193,9 @@ public final class MacFSUAEMCPServer: ObservableObject {
         workerFramePaths.removeAll()
         for path in workerExchangePaths.values { try? FileManager.default.removeItem(atPath: path) }
         workerExchangePaths.removeAll()
+        for path in workerControlPaths.values { try? FileManager.default.removeItem(atPath: path) }
+        workerControlPaths.removeAll()
+        workerLaunches.removeAll()
         guestCommands.removeAll()
         guestCommandByMachine.removeAll()
         workerOutputBuffers.removeAll()
@@ -1031,6 +1222,10 @@ public final class MacFSUAEMCPServer: ObservableObject {
         if let path = workerExchangePaths.removeValue(forKey: id) {
             try? FileManager.default.removeItem(atPath: path)
         }
+        if let path = workerControlPaths.removeValue(forKey: id) {
+            try? FileManager.default.removeItem(atPath: path)
+        }
+        workerLaunches[id] = nil
         workerOutputBuffers[id] = nil
         workerAcknowledgements[id] = nil
         workerHealthDates[id] = nil
@@ -1092,7 +1287,8 @@ public final class MacFSUAEMCPServer: ObservableObject {
     }
 
     private func consumeDrives(_ id: String, encoded: String) {
-        guard let data = Data(base64Encoded: encoded),
+        guard NSApp.mainMenu?.highlightedItem == nil,
+              let data = Data(base64Encoded: encoded),
               let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
               let index = runningMachines.firstIndex(where: { $0.id == id }) else { return }
         runningMachines[index].drives = rows.compactMap { row in
@@ -1106,7 +1302,8 @@ public final class MacFSUAEMCPServer: ObservableObject {
     }
 
     private func consumeHealth(_ id: String, fields: [Substring]) {
-        guard fields.count == 17,
+        guard NSApp.mainMenu?.highlightedItem == nil,
+              fields.count == 18,
               let sequence = UInt64(fields[1]),
               let pc = UInt32(fields[2]),
               let execBase = UInt32(fields[3]),
@@ -1129,6 +1326,7 @@ public final class MacFSUAEMCPServer: ObservableObject {
         runningMachines[index].exceptionPC = exceptionPC
         runningMachines[index].exceptionAddress = exceptionAddress
         runningMachines[index].exceptionTask = exceptionTask
+        runningMachines[index].debuggerStopped = fields[17] == "1"
         runningMachines[index].exceptionTaskName = fields[16] == "-" ? "" :
             Data(base64Encoded: String(fields[16])).map { String(decoding: $0, as: UTF8.self) } ?? ""
         runningMachines[index].guestControlGeneration = guestGeneration
@@ -1213,6 +1411,7 @@ public final class MacFSUAEMCPServer: ObservableObject {
             "program_counter": String(format: "0x%08x", machine.programCounter),
             "guest_control_ready": machine.guestControlReady,
             "guest_control_generation": machine.guestControlGeneration,
+            "debugger_stopped": machine.debuggerStopped,
         ]
         if let heartbeatAge { row["health_age_seconds"] = heartbeatAge }
         if let guestControlAge { row["guest_control_age_seconds"] = guestControlAge }
@@ -1646,6 +1845,18 @@ public final class MacFSUAEMCPServer: ObservableObject {
                                             name: "FSUAE-Control-Status")
             if let status = try? Data(contentsOf: statusURL),
                parseGuestStatus(status, token: startedRequest.token) != nil {
+                let heartbeat = workerGuestHeartbeats[machineID]
+                do {
+                    try await waitForGuestControl(machineID, after: heartbeat,
+                                                  timeout: .seconds(4))
+                } catch {
+                    let failure = "control channel stopped after command completion"
+                    if var guestRequest = guestCommands[request] {
+                        guestRequest.failure = failure
+                        guestCommands[request] = guestRequest
+                    }
+                    throw MCPFailure("Guest command failed: \(failure)")
+                }
                 return try guestCommandResult(["request_id": request])
             }
             if let failure = guestFailure(machineID, request: startedRequest) {
@@ -1785,8 +1996,9 @@ public final class MacFSUAEMCPServer: ObservableObject {
     }
 
     private func waitForGuestControl(_ machineID: String,
-                                     after heartbeat: UInt32? = nil) async throws {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+                                     after heartbeat: UInt32? = nil,
+                                     timeout: Duration = .seconds(10)) async throws {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
         repeat {
             guard workerProcesses[machineID]?.isRunning == true else {
                 throw MCPFailure("No running machine \(machineID)")
@@ -1858,11 +2070,83 @@ public final class MacFSUAEMCPServer: ObservableObject {
         return try jsonText(result)
     }
 
+    private func snapshotDirectory(configuration: String) throws -> URL {
+        guard library.configuration(named: configuration) != nil else {
+            throw MCPFailure("Unknown configuration \(configuration)")
+        }
+        return library.directory.deletingLastPathComponent()
+            .appendingPathComponent("Save States", isDirectory: true)
+            .appendingPathComponent(configuration, isDirectory: true)
+    }
+
+    private func snapshot(at url: URL, configuration: String) -> MacFSUAESnapshot? {
+        guard url.pathExtension.lowercased() == "uss" else { return nil }
+        let id = url.deletingPathExtension().lastPathComponent
+        guard let divider = id.range(of: "--") else { return nil }
+        let values = try? url.resourceValues(forKeys: [.creationDateKey,
+                                                       .contentModificationDateKey,
+                                                       .fileSizeKey])
+        return MacFSUAESnapshot(
+            id: id, name: String(id[divider.upperBound...]), configuration: configuration,
+            created: values?.creationDate ?? values?.contentModificationDate ?? .distantPast,
+            size: values?.fileSize ?? 0)
+    }
+
+    private func snapshotURL(_ id: String, configuration: String) throws -> URL {
+        guard snapshots(configuration: configuration).contains(where: { $0.id == id }) else {
+            throw MCPFailure("Unknown snapshot \(id)")
+        }
+        return try snapshotDirectory(configuration: configuration)
+            .appendingPathComponent(id).appendingPathExtension("uss")
+    }
+
+    private func snapshotDictionary(_ value: MacFSUAESnapshot) -> [String: Any] {
+        ["snapshot_id": value.id, "name": value.name,
+         "configuration": value.configuration,
+         "created": ISO8601DateFormatter().string(from: value.created),
+         "size_bytes": value.size]
+    }
+
+    private func snapshotJSON(_ value: MacFSUAESnapshot) throws -> String {
+        try jsonText(snapshotDictionary(value))
+    }
+
+    private func runSnapshot(_ machineID: String, action: String, url: URL) async throws {
+        guard workerProcesses[machineID]?.isRunning == true,
+              let controlPath = workerControlPaths[machineID] else {
+            throw MCPFailure("No running machine \(machineID)")
+        }
+        guard snapshotMachines.insert(machineID).inserted else {
+            throw MCPFailure("Machine \(machineID) already has a snapshot operation running")
+        }
+        defer { snapshotMachines.remove(machineID) }
+        let request = UUID().uuidString.lowercased()
+        let resultURL = URL(fileURLWithPath: controlPath, isDirectory: true)
+            .appendingPathComponent("FSUAE-Snapshot-\(request)")
+        defer { try? FileManager.default.removeItem(at: resultURL) }
+        guard sendWorkerCommand(machineID, ["command": "snapshot", "request_id": request,
+                                             "action": action, "path": url.path]) else {
+            throw MCPFailure("Could not send snapshot command to machine \(machineID)")
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(60))
+        repeat {
+            if let data = try? Data(contentsOf: resultURL),
+               let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                guard result["succeeded"] as? Bool == true else {
+                    throw MCPFailure(result["error"] as? String ?? "Snapshot operation failed")
+                }
+                return
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        } while ContinuousClock.now < deadline
+        throw MCPFailure("Snapshot operation timed out")
+    }
+
     /// Runs debugger commands on the emulator thread and returns raw console output.
     private func runDebugger(_ machineID: String,
                              _ commands: [String]) async throws -> (succeeded: Bool, output: String) {
         guard workerProcesses[machineID]?.isRunning == true,
-              workerExchangePaths[machineID] != nil else {
+              let controlPath = workerControlPaths[machineID] else {
             throw MCPFailure("No running machine \(machineID)")
         }
         guard debuggerMachines.insert(machineID).inserted else {
@@ -1870,8 +2154,8 @@ public final class MacFSUAEMCPServer: ObservableObject {
         }
         defer { debuggerMachines.remove(machineID) }
         let request = UUID().uuidString.lowercased()
-        let resultURL = try exchangeURL(machineID: machineID,
-                                        name: "FSUAE-Debug-\(request)")
+        let resultURL = URL(fileURLWithPath: controlPath, isDirectory: true)
+            .appendingPathComponent("FSUAE-Debug-\(request)")
         defer { try? FileManager.default.removeItem(at: resultURL) }
         guard sendWorkerCommand(machineID, ["command": "debug", "request_id": request,
                                              "commands": commands]) else {
@@ -1906,6 +2190,181 @@ public final class MacFSUAEMCPServer: ObservableObject {
         let result = try await runDebugger(machineID, commands)
         return try jsonText(["machine_id": machineID, "commands": commands,
                              "succeeded": result.succeeded, "output": result.output])
+    }
+
+    private func debugBreakpoints(_ arguments: [String: Any]) async throws -> String {
+        let machineID = try requiredString("machine_id", in: arguments)
+        let action = try requiredString("action", in: arguments)
+        guard ["set", "remove", "list", "clear"].contains(action) else {
+            throw MCPFailure("action must be set, remove, list, or clear")
+        }
+        var listed = try await runDebugger(machineID, ["fl"])
+        guard listed.succeeded else { throw MCPFailure("Could not list breakpoints") }
+        var addresses = parseDebuggerBreakpoints(listed.output)
+
+        if action == "clear", !addresses.isEmpty {
+            listed = try await runDebugger(machineID, ["fd"])
+            guard listed.succeeded else { throw MCPFailure("Could not clear breakpoints") }
+            addresses.removeAll()
+        } else if action == "set" || action == "remove" {
+            let text = try requiredString("address", in: arguments)
+            guard let address = parseHex(text) else {
+                throw MCPFailure("Address must be hexadecimal")
+            }
+            let contains = addresses.contains(address)
+            if (action == "set") != contains {
+                let changed = try await runDebugger(
+                    machineID, [String(format: "f %08x", address)])
+                guard changed.succeeded else { throw MCPFailure("Could not change breakpoint") }
+                if action == "set" {
+                    addresses.append(address)
+                    addresses.sort()
+                } else {
+                    addresses.removeAll { $0 == address }
+                }
+                listed = changed
+            }
+        }
+        return try jsonText([
+            "machine_id": machineID, "action": action,
+            "breakpoints": addresses.map { String(format: "0x%08x", $0) },
+            "output": listed.output,
+        ])
+    }
+
+    private func debugExecution(_ arguments: [String: Any]) async throws -> String {
+        let machineID = try requiredString("machine_id", in: arguments)
+        let action = try requiredString("action", in: arguments)
+        let command: String
+        switch action {
+        case "continue":
+            command = "g"
+        case "step":
+            let count = arguments["instructions"] as? Int ?? 1
+            guard (1...10_000).contains(count) else {
+                throw MCPFailure("instructions must be between 1 and 10000")
+            }
+            command = count == 1 ? "t" : "t \(count)"
+        case "step_over":
+            command = "z"
+        default:
+            throw MCPFailure("action must be continue, step, or step_over")
+        }
+        let result = try await runDebugger(machineID, [command])
+        if let index = runningMachines.firstIndex(where: { $0.id == machineID }) {
+            runningMachines[index].debuggerStopped = false
+        }
+        return try jsonText([
+            "machine_id": machineID, "action": action, "accepted": result.succeeded,
+            "state": action == "continue" ? "running" : "stepping",
+            "output": result.output,
+        ])
+    }
+
+    private func debugWait(_ arguments: [String: Any]) async throws -> String {
+        let machineID = try requiredString("machine_id", in: arguments)
+        let timeout = arguments["timeout_seconds"] as? Int ?? 30
+        guard (1...300).contains(timeout) else {
+            throw MCPFailure("timeout_seconds must be between 1 and 300")
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(timeout))
+        repeat {
+            guard let machine = runningMachines.first(where: { $0.id == machineID }) else {
+                throw MCPFailure("No running machine \(machineID)")
+            }
+            if machine.debuggerStopped {
+                let snapshot = try await runDebugger(machineID, ["r", "H 32", "T"])
+                var payload = machineRow(machine)
+                payload["status"] = "stopped"
+                payload["reason"] = machine.exceptionVector == 0
+                    ? "breakpoint_or_step" : exceptionName(machine.exceptionVector)
+                payload["debugger_output"] = snapshot.output
+                if let location = try? await resolveAddress(machineID, machine.programCounter),
+                   location["found"] as? Bool == true {
+                    payload["location"] = location
+                }
+                return try jsonText(payload)
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        } while ContinuousClock.now < deadline
+        return try jsonText([
+            "machine_id": machineID, "status": "timeout", "debugger_stopped": false,
+        ])
+    }
+
+    private func machineInspect(_ arguments: [String: Any]) async throws -> String {
+        let machineID = try requiredString("machine_id", in: arguments)
+        guard let machine = runningMachines.first(where: { $0.id == machineID }) else {
+            throw MCPFailure("No running machine \(machineID)")
+        }
+        let requested = arguments["domains"] as? [String]
+            ?? ["cpu", "history", "tasks", "hardware", "performance"]
+        let allowed = Set(["cpu", "history", "tasks", "hardware", "custom",
+                           "copper", "memory", "performance"])
+        guard !requested.isEmpty, requested.allSatisfy(allowed.contains) else {
+            throw MCPFailure("domains contains an unsupported inspection domain")
+        }
+        let lines = arguments["lines"] as? Int ?? 16
+        guard (1...256).contains(lines) else {
+            throw MCPFailure("lines must be between 1 and 256")
+        }
+        let memoryAddress: UInt32
+        if let text = optionalString("address", in: arguments) {
+            guard let parsed = parseHex(text) else {
+                throw MCPFailure("Address must be hexadecimal")
+            }
+            memoryAddress = parsed
+        } else {
+            memoryAddress = machine.programCounter
+        }
+        let commandByDomain: [String: String] = [
+            "cpu": "r", "history": "H 32", "tasks": "T", "hardware": "c",
+            "custom": "e", "copper": "o 0 32",
+            "memory": String(format: "m %x %d", memoryAddress, lines),
+        ]
+        let pairs: [(domain: String, command: String)] = requested.compactMap { domain in
+            commandByDomain[domain].map { (domain: domain, command: $0) }
+        }
+        var inspection: [String: Any] = [:]
+        if !pairs.isEmpty {
+            let result = try await runDebugger(machineID, pairs.map { $0.command })
+            for (domain, value) in debuggerSections(result.output, pairs: pairs) {
+                inspection[domain] = value
+            }
+        }
+        if requested.contains("performance") {
+            inspection["performance"] = [
+                "frame_sequence": machine.frameSequence,
+                "program_counter": String(format: "0x%08x", machine.programCounter),
+                "speed": machine.speed,
+                "paused": machine.isPaused,
+                "debugger_stopped": machine.debuggerStopped,
+            ]
+        }
+        return try jsonText([
+            "machine_id": machineID, "source": "emulator", "domains": inspection,
+        ])
+    }
+
+    private func debuggerSections(_ output: String,
+                                  pairs: [(domain: String, command: String)]) -> [String: String] {
+        var sections: [String: String] = [:]
+        for index in pairs.indices {
+            let marker = "> \(pairs[index].command)\n"
+            guard let markerRange = output.range(of: marker) else { continue }
+            let start = markerRange.upperBound
+            let end: String.Index
+            if index + 1 < pairs.count {
+                let next = "> \(pairs[index + 1].command)\n"
+                end = output.range(of: next, range: start..<output.endIndex)?.lowerBound
+                    ?? output.endIndex
+            } else {
+                end = output.endIndex
+            }
+            sections[pairs[index].domain] = String(output[start..<end])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return sections
     }
 
     // MARK: - Segment tracker

@@ -21,6 +21,7 @@
 #include "newcpu.h"
 #include "debug.h"
 #include "filesys.h"
+#include "savestate.h"
 #include "uae/memory.h"
 extern "C" {
 #include "fs-uae/config-drives.h"
@@ -35,12 +36,13 @@ extern "C" {
 
 namespace {
 
-enum class CommandType { input, mousePosition, pause, reset, floppy, debug, quit };
+enum class CommandType { input, mousePosition, pause, reset, floppy, debug, snapshot, quit };
 
 struct DebugRequest {
     std::mutex mutex;
     std::condition_variable ready;
     bool complete = false;
+    bool succeeded = false;
     std::string output;
 };
 
@@ -328,6 +330,23 @@ void process_commands(int)
 #endif
                         std::lock_guard<std::mutex> lock(command.debug_request->mutex);
                         command.debug_request->output = output.data();
+                        command.debug_request->succeeded = true;
+                        command.debug_request->complete = true;
+                        command.debug_request->ready.notify_one();
+                    }
+                    break;
+                case CommandType::snapshot:
+                    if (command.debug_request) {
+                        bool succeeded;
+                        if (command.first) {
+                            restore_state(command.path.c_str());
+                            succeeded = savestate_state != 0;
+                        } else {
+                            savestate_initsave(command.path.c_str(), 1, 1, true);
+                            succeeded = save_state(command.path.c_str(), _T("")) != 0;
+                        }
+                        std::lock_guard<std::mutex> lock(command.debug_request->mutex);
+                        command.debug_request->succeeded = succeeded;
                         command.debug_request->complete = true;
                         command.debug_request->ready.notify_one();
                     }
@@ -590,6 +609,11 @@ int fsuaemac_get_health(fsuaemac_health *health)
         health->exception_pc = health_exception_pc.load();
         health->exception_address = health_exception_address.load();
         health->exception_task = health_exception_task.load();
+#ifdef DEBUGGER
+        health->debugger_stopped = debugging != 0;
+#else
+        health->debugger_stopped = 0;
+#endif
         std::snprintf(health->exception_task_name,
                       sizeof(health->exception_task_name), "%s",
                       health_exception_task_name);
@@ -764,6 +788,28 @@ int fsuaemac_debug_command(const char *command, char *output,
     }
     std::snprintf(output, output_size, "%s", request->output.c_str());
     return 1;
+}
+
+int fsuaemac_snapshot(const char *path, int32_t restore, uint32_t timeout_ms)
+{
+    if (!path || !path[0] || std::strlen(path) >= MAX_DPATH) {
+        set_error("Invalid snapshot path");
+        return 0;
+    }
+    auto request = std::make_shared<DebugRequest>();
+    if (!queue_command({CommandType::snapshot, restore != 0, 0, path, request})) {
+        return 0;
+    }
+    std::unique_lock<std::mutex> lock(request->mutex);
+    if (!request->ready.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                 [&] { return request->complete; })) {
+        set_error("Snapshot operation timed out");
+        return 0;
+    }
+    if (!request->succeeded) {
+        set_error(restore ? "Snapshot restore failed" : "Snapshot save failed");
+    }
+    return request->succeeded ? 1 : 0;
 }
 
 const char *fsuaemac_last_error(void)

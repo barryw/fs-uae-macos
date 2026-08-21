@@ -27,12 +27,15 @@ public struct MacFSUAEInputControls {
 public struct MacFSUAEDisplayView: NSViewRepresentable {
     private let source: MacFSUAEFrameSource
     private let capturesMouse: Bool
-    private let controls: MacFSUAEInputControls
+    private let capturesMouseOnFocus: Bool
+    private let controls: MacFSUAEInputControls?
 
     public init(source: MacFSUAEFrameSource, capturesMouse: Bool = true,
-                controls: MacFSUAEInputControls = .local) {
+                capturesMouseOnFocus: Bool = false,
+                controls: MacFSUAEInputControls? = .local) {
         self.source = source
         self.capturesMouse = capturesMouse
+        self.capturesMouseOnFocus = capturesMouseOnFocus
         self.controls = controls
     }
 
@@ -41,8 +44,15 @@ public struct MacFSUAEDisplayView: NSViewRepresentable {
     }
 
     public func makeNSView(context: Context) -> MTKView {
-        let view = MacFSUAEInputView(controls: controls)
-        view.capturesMouse = capturesMouse
+        let view: MTKView
+        if let controls {
+            let inputView = MacFSUAEInputView(controls: controls)
+            inputView.capturesMouse = capturesMouse
+            inputView.capturesMouseOnFocus = capturesMouseOnFocus
+            view = inputView
+        } else {
+            view = MTKView()
+        }
         view.device = context.coordinator.device
         view.delegate = context.coordinator
         view.colorPixelFormat = .bgra8Unorm
@@ -50,12 +60,13 @@ public struct MacFSUAEDisplayView: NSViewRepresentable {
         view.preferredFramesPerSecond = 60
         view.enableSetNeedsDisplay = false
         view.isPaused = false
-        view.setAccessibilityLabel("Amiga display")
+        view.setAccessibilityLabel(controls == nil ? "Amiga spectator display" : "Amiga display")
         return view
     }
 
     public func updateNSView(_ nsView: MTKView, context: Context) {
         (nsView as? MacFSUAEInputView)?.capturesMouse = capturesMouse
+        (nsView as? MacFSUAEInputView)?.capturesMouseOnFocus = capturesMouseOnFocus
     }
 }
 
@@ -66,6 +77,7 @@ private final class MacFSUAEInputView: MTKView {
             if !capturesMouse { setMouseCaptured(false) }
         }
     }
+    var capturesMouseOnFocus = false
     private var trackingArea: NSTrackingArea?
     private var isMouseInside = false
     private var isMouseCaptured = false
@@ -104,8 +116,18 @@ private final class MacFSUAEInputView: MTKView {
         NotificationCenter.default.addObserver(
             self, selector: #selector(windowFocusChanged),
             name: NSWindow.didResignKeyNotification, object: window)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(menuDidBeginTracking),
+            name: NSMenu.didBeginTrackingNotification, object: nil)
         window.acceptsMouseMovedEvents = true
         updateTrackingAreas()
+        if capturesMouse && capturesMouseOnFocus {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.window?.isKeyWindow == true else { return }
+                self.window?.makeFirstResponder(self)
+                self.setMouseCaptured(true)
+            }
+        }
     }
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
@@ -232,12 +254,20 @@ private final class MacFSUAEInputView: MTKView {
         if event.keyCode == 57 {
             _ = controls.key(target, true)
             _ = controls.key(target, false)
+            return
+        }
+
+        let isPressed = CGEventSource.keyState(
+            .combinedSessionState, key: CGKeyCode(event.keyCode))
+        if isPressed {
+            guard pressedKeys[event.keyCode] == nil else { return }
+            if controls.key(target, true) {
+                pressedKeys[event.keyCode] = target
+            } else {
+                super.flagsChanged(with: event)
+            }
         } else if let pressed = pressedKeys.removeValue(forKey: event.keyCode) {
             _ = controls.key(pressed, false)
-        } else if controls.key(target, true) {
-            pressedKeys[event.keyCode] = target
-        } else {
-            super.flagsChanged(with: event)
         }
     }
 
@@ -276,10 +306,20 @@ private final class MacFSUAEInputView: MTKView {
     }
 
     @objc private func windowFocusChanged() {
-        if window?.isKeyWindow != true {
+        if window?.isKeyWindow == true {
+            if capturesMouse && capturesMouseOnFocus {
+                window?.makeFirstResponder(self)
+                setMouseCaptured(true)
+            }
+        } else {
             releaseKeys()
             setMouseCaptured(false)
         }
+    }
+
+    @objc private func menuDidBeginTracking() {
+        setMouseCaptured(false)
+        releaseKeys()
     }
 
     private func releaseKeys() {

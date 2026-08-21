@@ -2426,8 +2426,7 @@ control_proc:
 	move.l #$800003F3,-(sp) ; NP_StackSize
 	pea control_name(pc)
 	move.l #$800003F4,-(sp) ; NP_Name
-	moveq #-1,d0
-	move.l d0,-(sp) ; NP_WindowPtr data: suppress requesters in the automation process
+	clr.l -(sp) ; NP_WindowPtr data: older asl.library versions require NULL, not -1
 	move.l #$800003F7,-(sp) ; NP_WindowPtr
 	move.l d4,-(sp) ; output handle
 	move.l #$80000022,-(sp) ; SYS_Output

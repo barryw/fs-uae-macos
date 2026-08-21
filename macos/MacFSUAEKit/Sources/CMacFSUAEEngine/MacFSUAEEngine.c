@@ -19,6 +19,7 @@ typedef struct Symbols {
     int (*queueMousePosition)(int32_t, int32_t);
     int (*queueMouseButton)(uint32_t, int32_t);
     int (*debugCommand)(const char *, char *, uint32_t, uint32_t);
+    int (*snapshot)(const char *, int32_t, uint32_t);
     int (*setSpeed)(double);
     int (*queuePause)(int32_t);
     int (*queueReset)(int32_t);
@@ -64,6 +65,7 @@ int MacFSUAEEngineLoad(const char *path)
     LOAD(queueMousePosition, "fsuaemac_queue_mouse_position");
     LOAD(queueMouseButton, "fsuaemac_queue_mouse_button");
     LOAD(debugCommand, "fsuaemac_debug_command");
+    LOAD(snapshot, "fsuaemac_snapshot");
     LOAD(setSpeed, "fsuaemac_set_speed");
     LOAD(queuePause, "fsuaemac_queue_pause");
     LOAD(queueReset, "fsuaemac_queue_reset");
@@ -122,6 +124,7 @@ int MacFSUAEEngineQueueMouseMove(int32_t deltaX, int32_t deltaY) { return symbol
 int MacFSUAEEngineQueueMousePosition(int32_t x, int32_t y) { return symbols.queueMousePosition ? symbols.queueMousePosition(x, y) : 0; }
 int MacFSUAEEngineQueueMouseButton(uint32_t button, int32_t pressed) { return symbols.queueMouseButton ? symbols.queueMouseButton(button, pressed) : 0; }
 int MacFSUAEEngineDebugCommand(const char *command, char *output, uint32_t outputSize, uint32_t timeoutMilliseconds) { return symbols.debugCommand ? symbols.debugCommand(command, output, outputSize, timeoutMilliseconds) : 0; }
+int MacFSUAEEngineSnapshot(const char *path, int32_t restore, uint32_t timeoutMilliseconds) { return symbols.snapshot ? symbols.snapshot(path, restore, timeoutMilliseconds) : 0; }
 int MacFSUAEEngineSetSpeed(double multiplier) { return symbols.setSpeed ? symbols.setSpeed(multiplier) : 0; }
 int MacFSUAEEngineQueuePause(int32_t paused) { return symbols.queuePause ? symbols.queuePause(paused) : 0; }
 int MacFSUAEEngineQueueReset(int32_t hard) { return symbols.queueReset ? symbols.queueReset(hard) : 0; }

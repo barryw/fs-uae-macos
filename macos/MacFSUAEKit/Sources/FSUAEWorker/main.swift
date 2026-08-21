@@ -58,7 +58,7 @@ struct FSUAEWorker {
                 let alert = health.lastAlert.map(String.init).joined(separator: " ")
                 let task = health.exceptionTaskName.isEmpty ? "-" :
                     Data(health.exceptionTaskName.utf8).base64EncodedString()
-                fputs("FSUAE_HEALTH \(health.frameSequence) \(health.programCounter) \(health.execBase) \(alert) \(health.guestControlReady ? 1 : 0) \(health.guestControlHeartbeat) \(health.guestControlGeneration) \(health.exceptionSequence) \(health.exceptionVector) \(health.exceptionPC) \(health.exceptionAddress) \(health.exceptionTask) \(task)\n", stderr)
+                fputs("FSUAE_HEALTH \(health.frameSequence) \(health.programCounter) \(health.execBase) \(alert) \(health.guestControlReady ? 1 : 0) \(health.guestControlHeartbeat) \(health.guestControlGeneration) \(health.exceptionSequence) \(health.exceptionVector) \(health.exceptionPC) \(health.exceptionAddress) \(health.exceptionTask) \(task) \(health.debuggerStopped ? 1 : 0)\n", stderr)
                 fflush(stderr)
                 heartbeat = .now
             }
@@ -112,7 +112,7 @@ struct FSUAEWorker {
                   UUID(uuidString: request) != nil,
                   let commands = command["commands"] as? [String],
                   !commands.isEmpty,
-                  let exchange = ProcessInfo.processInfo.environment["FSUAE_MAC_EXCHANGE_DIRECTORY"]
+                  let exchange = ProcessInfo.processInfo.environment["FSUAE_MAC_CONTROL_DIRECTORY"]
             else { return }
             var output = ""
             var succeeded = true
@@ -131,6 +131,25 @@ struct FSUAEWorker {
             if let data = try? JSONSerialization.data(withJSONObject: result) {
                 try? data.write(to: URL(fileURLWithPath: exchange)
                     .appendingPathComponent("FSUAE-Debug-\(request)"), options: .atomic)
+            }
+        case "snapshot":
+            guard let request = command["request_id"] as? String,
+                  UUID(uuidString: request) != nil,
+                  let action = command["action"] as? String,
+                  ["save", "restore"].contains(action),
+                  let path = command["path"] as? String,
+                  let control = ProcessInfo.processInfo.environment["FSUAE_MAC_CONTROL_DIRECTORY"]
+            else { return }
+            let url = URL(fileURLWithPath: path)
+            let succeeded = action == "save"
+                ? session.saveState(to: url) : session.restoreState(from: url)
+            let result: [String: Any] = [
+                "succeeded": succeeded,
+                "error": succeeded ? "" : "Snapshot \(action) failed",
+            ]
+            if let data = try? JSONSerialization.data(withJSONObject: result) {
+                try? data.write(to: URL(fileURLWithPath: control)
+                    .appendingPathComponent("FSUAE-Snapshot-\(request)"), options: .atomic)
             }
         case "stop": stopSession(session)
         default: break

@@ -42,6 +42,7 @@ public struct MacFSUAEHealth: Sendable {
     public let exceptionPC: UInt32
     public let exceptionAddress: UInt32
     public let exceptionTask: UInt32
+    public let debuggerStopped: Bool
     public let exceptionTaskName: String
 }
 
@@ -352,6 +353,7 @@ public final class MacFSUAEEngineSession: ObservableObject {
             exceptionPC: value.exception_pc,
             exceptionAddress: value.exception_address,
             exceptionTask: value.exception_task,
+            debuggerStopped: value.debugger_stopped != 0,
             exceptionTaskName: taskName)
     }
 
@@ -372,6 +374,16 @@ public final class MacFSUAEEngineSession: ObservableObject {
         guard succeeded != 0 else { return nil }
         let bytes = output.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
         return String(decoding: bytes, as: UTF8.self)
+    }
+
+    public func saveState(to url: URL) -> Bool {
+        guard isRunning else { return false }
+        return url.path.withCString { MacFSUAEEngineSnapshot($0, 0, 60_000) != 0 }
+    }
+
+    public func restoreState(from url: URL) -> Bool {
+        guard isRunning else { return false }
+        return url.path.withCString { MacFSUAEEngineSnapshot($0, 1, 60_000) != 0 }
     }
 
     public func setAudioEnabled(_ enabled: Bool) {

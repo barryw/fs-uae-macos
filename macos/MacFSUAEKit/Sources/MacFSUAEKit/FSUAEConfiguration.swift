@@ -117,6 +117,9 @@ public struct FSUAEConfiguration: Identifiable, Equatable, Sendable {
     public var name: String { url.deletingPathExtension().lastPathComponent }
     public var model: String { value(for: "amiga_model") ?? "A500" }
     public var modelProfile: FSUAEModelProfile { .profile(for: model) }
+    public var hostIntegrationEnabled: Bool {
+        ["1", "true", "yes"].contains(value(for: "host_integration")?.lowercased() ?? "")
+    }
 
     public init(url: URL, text: String) {
         self.url = url
@@ -480,8 +483,8 @@ public struct FSUAEConfiguration: Identifiable, Equatable, Sendable {
         }
 
         let booleans = ["jit_compiler", "blizzard_scsi_kit", "cdrom_drive_0_delay", "cdfs",
-                        "bsdsocket_library", "clipboard_sharing", "save_states", "line_doubling",
-                        "low_resolution"]
+                        "bsdsocket_library", "clipboard_sharing", "host_integration",
+                        "save_states", "line_doubling", "low_resolution"]
             + (0..<10).map { "hard_drive_\($0)_read_only" }
         for key in booleans {
             for value in values(for: key) where !value.isEmpty {

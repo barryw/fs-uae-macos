@@ -9,6 +9,7 @@ private struct FSUAEFocusedActions {
     let canBoot: Bool
     let canStop: Bool
     let canPause: Bool
+    let canFullScreen: Bool
     let newConfiguration: () -> Void
     let editConfiguration: () -> Void
     let revealConfigurations: () -> Void
@@ -16,6 +17,7 @@ private struct FSUAEFocusedActions {
     let stop: () -> Void
     let pause: () -> Void
     let releaseMouse: () -> Void
+    let toggleFullScreen: () -> Void
     let reset: (Bool) -> Void
 }
 
@@ -30,6 +32,7 @@ private extension FocusedValues {
     }
 }
 
+@MainActor
 private struct FSUAECommands: Commands {
     @FocusedValue(\.fsuaeActions) private var actions
 
@@ -68,6 +71,20 @@ private struct FSUAECommands: Commands {
                 .disabled(actions?.canStop != true)
             Button("Hard Reset") { actions?.reset(true) }
                 .disabled(actions?.canStop != true)
+        }
+
+        CommandGroup(replacing: .sidebar) {
+            Button(FSUAEFullScreenPresenter.shared.isPresented
+                   ? "Exit Amiga Full Screen" : "Enter Amiga Full Screen") {
+                if FSUAEFullScreenPresenter.shared.isPresented {
+                    FSUAEFullScreenPresenter.shared.dismiss()
+                } else {
+                    actions?.toggleFullScreen()
+                }
+            }
+            .keyboardShortcut("f", modifiers: [.control, .command])
+            .disabled(actions?.canFullScreen != true &&
+                      !FSUAEFullScreenPresenter.shared.isPresented)
         }
     }
 }
@@ -138,6 +155,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+private final class FSUAEFullScreenWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
+@MainActor
+private final class FSUAEFullScreenPresenter {
+    static let shared = FSUAEFullScreenPresenter()
+
+    private var window: NSWindow?
+    private weak var owner: NSWindow?
+    var isPresented: Bool { window?.isVisible == true }
+
+    func present(source: MacFSUAEFrameSource, capturesMouse: Bool,
+                 controls: MacFSUAEInputControls?) {
+        guard window?.isVisible != true else { return }
+        owner = NSApp.keyWindow
+        let frame = owner?.screen?.frame ?? NSScreen.main?.frame
+            ?? NSRect(x: 0, y: 0, width: 960, height: 720)
+        let window = self.window ?? FSUAEFullScreenWindow(
+            contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.setFrame(frame, display: false)
+        window.title = "Amiga Display"
+        window.backgroundColor = .black
+        window.isOpaque = true
+        window.hasShadow = false
+        window.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 1)
+        window.collectionBehavior = [.canJoinAllSpaces, .ignoresCycle]
+        window.animationBehavior = .none
+        window.contentView = NSHostingView(rootView:
+            MacFSUAEDisplayView(source: source, capturesMouse: capturesMouse,
+                                capturesMouseOnFocus: capturesMouse,
+                                controls: controls)
+                .background(Color.black)
+                .ignoresSafeArea())
+        self.window = window
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    func dismiss() {
+        window?.makeFirstResponder(nil)
+        window?.orderOut(nil)
+        owner?.makeKeyAndOrderFront(nil)
+        owner = nil
+    }
+}
+
 private struct EmulatorView: View {
     @EnvironmentObject private var mcpServer: MacFSUAEMCPServer
     @StateObject private var library = FSUAEConfigurationLibrary.shared
@@ -147,6 +211,13 @@ private struct EmulatorView: View {
     @State private var importingFloppyDrive = 0
     @State private var showingConfigurationInfo = false
     @State private var operationError: String?
+    @State private var spectatingMachineID: String?
+    @State private var pendingHostIntegration: Bool?
+    @State private var showingSaveSnapshot = false
+    @State private var snapshotName = ""
+    @State private var pendingSnapshotRestore: MacFSUAESnapshot?
+    @State private var pendingSnapshotDelete: MacFSUAESnapshot?
+    @State private var snapshotRevision = 0
 
     private var selected: FSUAEConfiguration? {
         library.configurations.first { $0.url == selectedID }
@@ -158,6 +229,17 @@ private struct EmulatorView: View {
 
     private var selectedRunningMachine: MacFSUAERunningMachine? {
         selected.flatMap { mcpServer.runningMachine(configuration: $0.name) }
+    }
+
+    private var spectatedMachine: MacFSUAERunningMachine? {
+        guard let machine = selectedRunningMachine,
+              machine.presentation == "headless",
+              machine.id == spectatingMachineID else { return nil }
+        return machine
+    }
+
+    private var displayedMachine: MacFSUAERunningMachine? {
+        selectedMachine ?? spectatedMachine
     }
 
     private var canEditSelected: Bool {
@@ -174,7 +256,7 @@ private struct EmulatorView: View {
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 300)
         } detail: {
             VStack(spacing: 0) {
-                if selectedMachine != nil {
+                if displayedMachine != nil {
                     runningDisplay
                 } else {
                     configurationDetail
@@ -202,6 +284,47 @@ private struct EmulatorView: View {
                 Button("OK") { operationError = nil }
             } message: {
                 Text(operationError ?? "Unknown error")
+            }
+        .alert("Save Snapshot", isPresented: $showingSaveSnapshot) {
+            TextField("Snapshot name", text: $snapshotName)
+            Button("Cancel", role: .cancel) {}
+            Button("Save") { saveSnapshot() }
+                .disabled(snapshotLabel(snapshotName) == nil)
+        } message: {
+            Text("Save the current machine state to a new file.")
+        }
+        .confirmationDialog("Restore snapshot?", isPresented: Binding(
+            get: { pendingSnapshotRestore != nil },
+            set: { if !$0 { pendingSnapshotRestore = nil } })) {
+                Button("Restore", role: .destructive) {
+                    if let snapshot = pendingSnapshotRestore { restoreSnapshot(snapshot) }
+                    pendingSnapshotRestore = nil
+                }
+                Button("Cancel", role: .cancel) { pendingSnapshotRestore = nil }
+            } message: {
+                Text("The machine's current unsaved state will be replaced.")
+            }
+        .confirmationDialog("Delete snapshot?", isPresented: Binding(
+            get: { pendingSnapshotDelete != nil },
+            set: { if !$0 { pendingSnapshotDelete = nil } })) {
+                Button("Delete", role: .destructive) {
+                    if let snapshot = pendingSnapshotDelete { deleteSnapshot(snapshot) }
+                    pendingSnapshotDelete = nil
+                }
+                Button("Cancel", role: .cancel) { pendingSnapshotDelete = nil }
+            } message: {
+                Text("This permanently deletes the snapshot file.")
+            }
+        .confirmationDialog("Restart the machine?", isPresented: Binding(
+            get: { pendingHostIntegration != nil },
+            set: { if !$0 { pendingHostIntegration = nil } })) {
+                Button(pendingHostIntegration == true
+                       ? "Restart and Enable" : "Restart and Disable", role: .destructive) {
+                    applyHostIntegrationChange()
+                }
+                Button("Cancel", role: .cancel) { pendingHostIntegration = nil }
+            } message: {
+                Text("Changing Host Integration requires a cold restart. Unsaved work in the Amiga will be lost.")
             }
         .onAppear {
             ensureSelection()
@@ -288,6 +411,17 @@ private struct EmulatorView: View {
         }
 
         ToolbarItemGroup(placement: .primaryAction) {
+            if let machine = selectedRunningMachine, machine.presentation == "headless" {
+                let isSpectating = spectatingMachineID == machine.id
+                Button {
+                    spectatingMachineID = isSpectating ? nil : machine.id
+                } label: {
+                    Label(isSpectating ? "Hide Spectator View" : "Show Spectator View",
+                          systemImage: isSpectating ? "eye.slash" : "eye")
+                }
+                .help(isSpectating ? "Hide Spectator View" : "Show Spectator View")
+            }
+
             Button { selectedMachine == nil ? boot() : stop() } label: {
                 Label(selectedMachine == nil ? "Boot" : "Stop",
                       systemImage: selectedMachine == nil ? "play.fill" : "stop.fill")
@@ -302,6 +436,38 @@ private struct EmulatorView: View {
             }
             .disabled(selectedMachine == nil)
             .help(selectedMachine?.isPaused == true ? "Resume" : "Pause")
+
+            if let configuration = selected {
+                let snapshots = mcpServer.snapshots(configuration: configuration.name)
+                Menu {
+                    Button("Save Snapshot…") {
+                        snapshotName = "Snapshot \(snapshots.count + 1)"
+                        showingSaveSnapshot = true
+                    }
+                    .disabled(selectedRunningMachine == nil)
+                    if snapshots.isEmpty {
+                        Divider()
+                        Text("No Snapshots")
+                    } else {
+                        Divider()
+                        ForEach(snapshots) { snapshot in
+                            Menu {
+                                Button("Restore") { pendingSnapshotRestore = snapshot }
+                                    .disabled(selectedRunningMachine == nil)
+                                Button("Delete", role: .destructive) {
+                                    pendingSnapshotDelete = snapshot
+                                }
+                            } label: {
+                                Text("\(snapshot.name) · \(snapshot.created.formatted(date: .abbreviated, time: .shortened))")
+                            }
+                        }
+                    }
+                } label: {
+                    Label("Snapshots", systemImage: "camera.on.rectangle")
+                }
+                .id(snapshotRevision)
+                .help("Save or restore machine snapshots")
+            }
 
             Menu {
                 Button("Reset") { reset() }
@@ -372,15 +538,35 @@ private struct EmulatorView: View {
     private var runningDisplay: some View {
         ZStack {
             Color.black
-            if let machine = selectedMachine,
+            if let machine = displayedMachine,
                let source = mcpServer.frameSource(for: machine.id) {
                 MacFSUAEDisplayView(source: source,
-                                    capturesMouse: !machine.isPaused,
-                                    controls: mcpServer.inputControls(for: machine.id))
+                                    capturesMouse: machine.presentation == "headed" && !machine.isPaused,
+                                    controls: machine.presentation == "headed"
+                                        ? mcpServer.inputControls(for: machine.id) : nil)
                     .id(machine.id)
+                    .allowsHitTesting(machine.presentation == "headed")
             }
 
-            if selectedMachine?.isPaused == true {
+            if displayedMachine?.presentation == "headless" {
+                VStack {
+                    HStack {
+                        Label("Spectator Mode · View Only", systemImage: "eye.fill")
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(.regularMaterial, in: Capsule())
+                            .overlay(Capsule().stroke(.secondary.opacity(0.25), lineWidth: 1))
+                            .accessibilityLabel("Spectator mode, view only")
+                        Spacer()
+                    }
+                    Spacer()
+                }
+                .padding(16)
+                .allowsHitTesting(false)
+            }
+
+            if displayedMachine?.isPaused == true {
                 Color.black.opacity(0.52)
                     .allowsHitTesting(false)
                 Image(systemName: "pause.fill")
@@ -391,6 +577,7 @@ private struct EmulatorView: View {
             }
         }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+            guard selectedMachine != nil else { return false }
             guard let provider = providers.first else { return false }
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
                 guard let url else { return }
@@ -417,7 +604,8 @@ private struct EmulatorView: View {
                 .buttonStyle(.plain)
                 .help("Configuration Details")
                 .popover(isPresented: $showingConfigurationInfo) {
-                    ConfigurationInfoPopover(configuration: configuration)
+                    ConfigurationInfoPopover(configuration: configuration,
+                                             machine: selectedRunningMachine)
                 }
             }
 
@@ -426,6 +614,22 @@ private struct EmulatorView: View {
                     ? "\($0.status.capitalized) Headless" : $0.status.capitalized
             } ?? "Ready")
                 .foregroundStyle(.secondary)
+
+            if let configuration = selected, let machine = selectedRunningMachine {
+                Button {
+                    pendingHostIntegration = !configuration.hostIntegrationEnabled
+                } label: {
+                    Label(hostIntegrationStatus(configuration, machine: machine),
+                          systemImage: configuration.hostIntegrationEnabled
+                            ? (machine.guestControlReady ? "link.circle.fill" : "link.circle")
+                            : "link.badge.plus")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(configuration.hostIntegrationEnabled
+                                 && machine.guestControlReady ? .secondary : .tertiary)
+                .help(configuration.hostIntegrationEnabled
+                      ? "Disable Host Integration" : "Enable Host Integration")
+            }
 
             let headlessCount = mcpServer.runningMachines.count { $0.presentation == "headless" }
             if headlessCount > 0 {
@@ -451,6 +655,11 @@ private struct EmulatorView: View {
                 .help("Emulation Speed")
 
                 Text("Click display to control · ⌘G releases")
+                    .foregroundStyle(.tertiary)
+            } else if spectatedMachine != nil {
+                Label("Spectating", systemImage: "eye")
+                    .foregroundStyle(.secondary)
+                Text("Input disabled")
                     .foregroundStyle(.tertiary)
             }
 
@@ -490,6 +699,7 @@ private struct EmulatorView: View {
             canBoot: canBootSelected,
             canStop: selectedMachine != nil,
             canPause: selectedMachine != nil,
+            canFullScreen: displayedMachine != nil,
             newConfiguration: newConfiguration,
             editConfiguration: editSelected,
             revealConfigurations: {
@@ -499,7 +709,18 @@ private struct EmulatorView: View {
             stop: stop,
             pause: pause,
             releaseMouse: { NSApp.keyWindow?.makeFirstResponder(nil) },
+            toggleFullScreen: toggleDisplayFullScreen,
             reset: { reset(hard: $0) })
+    }
+
+    private func toggleDisplayFullScreen() {
+        guard let machine = displayedMachine,
+              let source = mcpServer.frameSource(for: machine.id) else { return }
+        FSUAEFullScreenPresenter.shared.present(
+            source: source,
+            capturesMouse: machine.presentation == "headed" && !machine.isPaused,
+            controls: machine.presentation == "headed"
+                ? mcpServer.inputControls(for: machine.id) : nil)
     }
 
     private func ensureSelection() {
@@ -536,6 +757,33 @@ private struct EmulatorView: View {
         mcpServer.reset(machine.id, hard: hard)
     }
 
+    private func saveSnapshot() {
+        guard let machine = selectedRunningMachine else { return }
+        let name = snapshotName
+        Task { @MainActor in
+            do {
+                try await mcpServer.saveSnapshot(machineID: machine.id, name: name)
+                snapshotRevision += 1
+            } catch { operationError = error.localizedDescription }
+        }
+    }
+
+    private func restoreSnapshot(_ snapshot: MacFSUAESnapshot) {
+        guard let machine = selectedRunningMachine else { return }
+        Task { @MainActor in
+            do { try await mcpServer.restoreSnapshot(machineID: machine.id, snapshotID: snapshot.id) }
+            catch { operationError = error.localizedDescription }
+        }
+    }
+
+    private func deleteSnapshot(_ snapshot: MacFSUAESnapshot) {
+        do {
+            try mcpServer.deleteSnapshot(configuration: snapshot.configuration,
+                                         snapshotID: snapshot.id)
+            snapshotRevision += 1
+        } catch { operationError = error.localizedDescription }
+    }
+
     private func editSelected() {
         guard let selected, canEditSelected else { return }
         editingConfiguration = selected
@@ -543,6 +791,39 @@ private struct EmulatorView: View {
 
     private func updateMachineSelection() {
         mcpServer.selectPresentedMachine(selectedMachine?.id)
+        if !mcpServer.runningMachines.contains(where: { $0.id == spectatingMachineID }) {
+            spectatingMachineID = nil
+        }
+    }
+
+    private func hostIntegrationStatus(_ configuration: FSUAEConfiguration,
+                                       machine: MacFSUAERunningMachine?) -> String {
+        guard configuration.hostIntegrationEnabled else { return "Integration Off" }
+        return machine?.guestControlReady == true ? "Integration Ready" : "Waiting for AmigaDOS"
+    }
+
+    private func applyHostIntegrationChange() {
+        guard let enabled = pendingHostIntegration,
+              var configuration = selected,
+              let machine = selectedRunningMachine else { return }
+        pendingHostIntegration = nil
+        let wasSpectating = spectatingMachineID == machine.id
+        configuration.setValue(enabled ? "1" : "0", for: "host_integration")
+        if !enabled { configuration.setValue("0", for: "clipboard_sharing") }
+
+        Task { @MainActor in
+            do {
+                configuration.url = try library.save(configuration, named: configuration.name)
+                let restarted = try await mcpServer.restart(machine.id,
+                                                            configuration: configuration)
+                if restarted.presentation == "headed" {
+                    mcpServer.selectPresentedMachine(restarted.id)
+                }
+                if wasSpectating { spectatingMachineID = restarted.id }
+            } catch {
+                operationError = error.localizedDescription
+            }
+        }
     }
 
     private func romSummary(_ configuration: FSUAEConfiguration) -> String {
@@ -646,6 +927,7 @@ private struct DriveActivityIndicator: View {
 
 private struct ConfigurationInfoPopover: View {
     let configuration: FSUAEConfiguration
+    let machine: MacFSUAERunningMachine?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -656,6 +938,7 @@ private struct ConfigurationInfoPopover: View {
                 detailRow("Video", configuration.value(for: "ntsc_mode") == "1" ? "NTSC" : "PAL")
                 detailRow("Kickstart", fileName(for: "kickstart_file"))
                 detailRow("DF0", fileName(for: "floppy_drive_0"))
+                detailRow("Host Integration", hostIntegrationStatus)
             }
         }
         .padding(16)
@@ -672,6 +955,12 @@ private struct ConfigurationInfoPopover: View {
 
     private func fileName(for key: String) -> String {
         configuration.value(for: key).map { ($0 as NSString).lastPathComponent } ?? "Not configured"
+    }
+
+    private var hostIntegrationStatus: String {
+        guard configuration.hostIntegrationEnabled else { return "Off" }
+        guard let machine else { return "Enabled at next boot" }
+        return machine.guestControlReady ? "Ready" : "Waiting for AmigaDOS"
     }
 }
 
@@ -925,9 +1214,18 @@ private struct ConfigurationEditor: View {
             Section("Audio") {
                 choiceSetting("Stereo separation", key: "stereo_separation")
             }
+            Section("Host Integration") {
+                Toggle("Enable Host Integration", isOn: hostIntegrationOption)
+                Text("Loads fsuae.device and the MCP: exchange volume when this machine boots. Supports 68k AmigaOS once AmigaDOS is running.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Toggle("Share clipboard", isOn: booleanOption("clipboard_sharing"))
+                    .disabled(!draft.hostIntegrationEnabled)
+                Button("Configure Shared Folders in Drives…") { pane = .drives }
+                    .disabled(!draft.hostIntegrationEnabled)
+            }
             Section("Amiga Integration") {
                 Toggle("BSD socket library", isOn: booleanOption("bsdsocket_library"))
-                Toggle("Share clipboard", isOn: booleanOption("clipboard_sharing"))
                 Toggle("Save states", isOn: booleanOption("save_states", default: true))
             }
             Section("Video Compatibility") {
@@ -964,6 +1262,13 @@ private struct ConfigurationEditor: View {
             guard let value = draft.value(for: key)?.lowercased() else { return defaultValue }
             return ["1", "true", "yes"].contains(value)
         }, set: { draft.setValue($0 ? "1" : "0", for: key) })
+    }
+
+    private var hostIntegrationOption: Binding<Bool> {
+        Binding(get: { draft.hostIntegrationEnabled }, set: {
+            draft.setValue($0 ? "1" : "0", for: "host_integration")
+            if !$0 { draft.setValue("0", for: "clipboard_sharing") }
+        })
     }
 
     private func integerOption(_ key: String, default defaultValue: Int) -> Binding<Int> {
